@@ -47,7 +47,7 @@ cmake -S . -B ~/veccore-build-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug && cmake -
 imaginary:
 
 ```bash
-~/veccore-build-debug/asan_probe
+~/veccore-build-debug/bin/asan_probe
 ```
 
 ## Data
@@ -66,7 +66,7 @@ ctest --test-dir ~/veccore-build --output-on-failure
 ```
 
 ```bash
-~/veccore-build/bench --tag phase0_rails --data-dir ~/veccore-data
+~/veccore-build/bin/bench --tag phase0_rails --data-dir ~/veccore-data
 ```
 
 `bench` refuses to write a record from a Debug, sanitized, or dirty-tree build unless you pass

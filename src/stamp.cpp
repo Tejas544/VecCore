@@ -18,23 +18,36 @@
 namespace veccore {
 namespace {
 
-/// Run a command and return its first line of stdout, trimmed.  Empty on any
-/// failure -- callers treat that as "unknown" rather than propagating an error,
-/// because a missing stamp field must never take down a benchmark run.
-std::string first_line_of(const char* cmd) {
+struct CmdResult {
+    int rc = -1;
+    std::string first_line;
+};
+
+/// Run a command, capturing stdout AND stderr, and return its first line.
+///
+/// Capturing stderr is deliberate.  The first version of this discarded it, so
+/// when git refused to read the repository (safe.directory -- see L-07) the
+/// stamp recorded `git_sha: "unknown"` and nothing else.  That is a true
+/// statement that hides the entire diagnosis: git had printed exactly what was
+/// wrong and exactly how to fix it, and we threw it away.
+///
+/// A missing stamp field must never take down a benchmark run -- but it must
+/// never be silent about why it is missing either.
+CmdResult run(const std::string& cmd) {
+    CmdResult result;
     std::array<char, 512> buf{};
-    FILE* pipe = ::popen(cmd, "r");
-    if (!pipe) return {};
-    std::string out;
+    FILE* pipe = ::popen((cmd + " 2>&1").c_str(), "r");
+    if (!pipe) return result;
     if (std::fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        out = buf.data();
+        result.first_line = buf.data();
     }
-    const int rc = ::pclose(pipe);
-    if (rc != 0) return {};
-    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' ')) {
-        out.pop_back();
+    result.rc = ::pclose(pipe);
+    while (!result.first_line.empty() &&
+           (result.first_line.back() == '\n' || result.first_line.back() == '\r' ||
+            result.first_line.back() == ' ')) {
+        result.first_line.pop_back();
     }
-    return out;
+    return result;
 }
 
 std::string read_cpu_model() {
@@ -68,7 +81,10 @@ bool EnvStamp::trusted() const { return untrusted_reason().empty(); }
 std::string EnvStamp::untrusted_reason() const {
     if (build_type != "Release")   return "build type is " + build_type + ", not Release";
     if (sanitizers != "none")      return "built with sanitizers (" + sanitizers + ")";
-    if (git_sha == "unknown")      return "git SHA could not be resolved";
+    if (git_sha == "unknown") {
+        return git_note.empty() ? "git SHA could not be resolved"
+                                : "git SHA could not be resolved: " + git_note;
+    }
     if (git_dirty)                 return "working tree is dirty";
     return {};
 }
@@ -96,13 +112,14 @@ EnvStamp capture_env(const std::string& disk_path) {
     // Provenance is resolved at *runtime*, not baked in at configure time -- a
     // SHA captured when you last ran cmake is a SHA that goes stale silently,
     // which is the exact failure D10 rule 7 exists to prevent.
-    const std::string git_dir = " -C \"" VECCORE_SOURCE_DIR "\" ";
-    const std::string sha = first_line_of(("git" + git_dir + "rev-parse --short HEAD 2>/dev/null").c_str());
-    if (!sha.empty()) {
-        s.git_sha = sha;
-        const std::string status =
-            first_line_of(("git" + git_dir + "status --porcelain 2>/dev/null | head -1").c_str());
-        s.git_dirty = !status.empty();
+    const std::string git = "git -C \"" VECCORE_SOURCE_DIR "\" ";
+    const CmdResult sha = run(git + "rev-parse --short HEAD");
+    if (sha.rc == 0 && !sha.first_line.empty()) {
+        s.git_sha = sha.first_line;
+        const CmdResult status = run(git + "status --porcelain");
+        s.git_dirty = !status.first_line.empty();
+    } else {
+        s.git_note = sha.first_line;  // git already said what is wrong; keep it
     }
 
     s.build_type = VECCORE_BUILD_TYPE;
@@ -123,6 +140,7 @@ std::string to_json(const EnvStamp& s) {
      .num("free_disk_gb", s.free_disk_gb)
      .str("git_sha", s.git_sha)
      .boolean("git_dirty", s.git_dirty)
+     .str("git_note", s.git_note)
      .str("veccore_version", VECCORE_VERSION)
      .str("build_type", s.build_type)
      .str("compiler", s.compiler)

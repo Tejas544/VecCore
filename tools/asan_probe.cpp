@@ -12,19 +12,16 @@
 #include <cstdio>
 
 int main() {
-    std::printf("asan_probe: writing one past the end of a 4-element heap array.
-");
-    std::printf("EXPECTED: an AddressSanitizer heap-buffer-overflow report, then abort.
-");
-    std::printf("If you see \"probe survived\" below, the sanitizers are NOT active.
-");
+    std::puts("asan_probe: writing one past the end of a 4-element heap array.");
+    std::puts("EXPECTED: an AddressSanitizer heap-buffer-overflow report, then abort.");
+    std::puts("If you see 'probe survived' below, the sanitizers are NOT active.");
+    std::fflush(stdout);
 
     int* p = new int[4];
     p[4] = 1;  // <-- deliberate: one past the end
     const int leaked = p[4];
     delete[] p;
 
-    std::printf("probe survived (value %d) -- SANITIZERS ARE NOT ACTIVE
-", leaked);
+    std::printf("probe survived (value %d) -- SANITIZERS ARE NOT ACTIVE\n", leaked);
     return 0;
 }

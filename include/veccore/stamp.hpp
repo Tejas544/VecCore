@@ -30,6 +30,9 @@ struct EnvStamp {
     // Provenance
     std::string git_sha = "unknown";
     bool        git_dirty = true;
+    /// Whatever git said when the SHA could not be resolved. Empty on success.
+    /// L-07: "unknown" alone is a true statement that hides the diagnosis.
+    std::string git_note;
 
     // Compile-time (from the generated build_info.hpp)
     std::string build_type;

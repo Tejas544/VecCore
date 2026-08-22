@@ -1,7 +1,9 @@
 # The source tree is edited on Windows and built/executed inside WSL2 (D2).
-# Without this, git's autocrlf turns scripts/fetch_sift.sh into a file whose
-# shebang ends in , and bash reports:
-#     /usr/bin/env: 'bash': No such file or directory
+# Without this, git's autocrlf gives scripts/fetch_sift.sh CRLF endings, so its
+# shebang ends in a carriage return and bash reports:
+#
+#     /usr/bin/env: 'bash^M': No such file or directory
+#
 # which names neither the file nor the real cause. Force LF everywhere; every
 # consumer of this repo is a Linux toolchain.
 * text=auto eol=lf
@@ -14,7 +16,9 @@
 *.md   text eol=lf
 *.txt  text eol=lf
 
-# Datasets are binary and must never be line-ending translated.
-*.fvecs binary
-*.ivecs binary
+# Datasets are binary and must never be line-ending translated. This half
+# matters more than it looks: CRLF translation of a vector file corrupts it
+# silently, and it would present as P-01 -- a completely unrelated diagnosis.
+*.fvecs  binary
+*.ivecs  binary
 *.tar.gz binary

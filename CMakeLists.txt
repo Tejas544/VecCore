@@ -17,6 +17,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # pybind11 in Phase 6 links this static lib into a shared object.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# All executables in one predictable place.  Not the build root: the `bench`
+# executable would collide with the `bench/` subdirectory CMake creates for that
+# subproject, and the link fails with an unhelpful "ld returned 1".
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -87,7 +91,12 @@ target_link_libraries(veccore_flags INTERFACE Threads::Threads)
 # Build stamp (D10).  Every JSON record carries these, so a number in the README
 # can always be traced back to the build that produced it.
 # ---------------------------------------------------------------------------
-string(STRIP "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${CMAKE_BUILD_TYPE}}" VECCORE_BASE_FLAGS)
+# CMake's per-config flag variables are UPPERCASE (CMAKE_CXX_FLAGS_DEBUG), while
+# CMAKE_BUILD_TYPE keeps whatever case you typed.  Without TOUPPER this expands
+# to CMAKE_CXX_FLAGS_Debug, which does not exist, and the stamp records an empty
+# flags string -- a D10 record that looks complete and says nothing.
+string(TOUPPER "${CMAKE_BUILD_TYPE}" VECCORE_BUILD_TYPE_UC)
+string(STRIP "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${VECCORE_BUILD_TYPE_UC}}" VECCORE_BASE_FLAGS)
 set(VECCORE_EFFECTIVE_FLAGS "${VECCORE_BASE_FLAGS}")
 if(VECCORE_NATIVE AND (CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo"))
   set(VECCORE_EFFECTIVE_FLAGS "${VECCORE_EFFECTIVE_FLAGS} -march=native")
