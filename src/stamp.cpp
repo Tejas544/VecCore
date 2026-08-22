@@ -116,7 +116,15 @@ EnvStamp capture_env(const std::string& disk_path) {
     const CmdResult sha = run(git + "rev-parse --short HEAD");
     if (sha.rc == 0 && !sha.first_line.empty()) {
         s.git_sha = sha.first_line;
-        const CmdResult status = run(git + "status --porcelain");
+        // Exclude results/ from the dirty check.  bench appends to
+        // results/bench.jsonl, which dirtied the tree and made the NEXT bench
+        // run refuse to write -- the harness invalidating its own trust
+        // condition by doing its job (B-03).
+        //
+        // The claim `trusted` makes is "this binary was built from commit X".
+        // A modified source file falsifies that.  An appended results file does
+        // not: it is the output, not the input.
+        const CmdResult status = run(git + "status --porcelain -- ':!results'");
         s.git_dirty = !status.first_line.empty();
     } else {
         s.git_note = sha.first_line;  // git already said what is wrong; keep it
