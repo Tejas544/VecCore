@@ -28,7 +28,12 @@ story is what the interview is actually about.
 
 | # | Symptom | Class | Cost |
 |---|---|---|---|
-| — | *none yet — build starts Aug 21* | | |
+| — | *none yet — Phase 0 landmines are logged below as L-01..L-07* | | |
+
+**Phase 0 scorecard:** 7 landmines defused, 0 confirmed bugs, ~1.5 h. Four of the seven
+(L-01, L-02, L-05, L-06) were found by checking a tool *before* depending on it rather than after.
+Two (L-03, L-07) came from reading output that was easy to scroll past — a docstring in someone
+else's code, and a warning phrased in the future tense.
 
 ---
 
@@ -187,6 +192,44 @@ P-01, a completely unrelated diagnosis.
 
 **Generalised lesson:** a warning that names a future tense — *"will be replaced the next time"* —
 is describing a bug you have not hit yet. Those are the cheapest ones to fix.
+
+### L-07 · The stamp reported "unknown" instead of the reason it was unknown · 2026-08-22 · Phase 0
+
+**Symptom.** The first clean `bench` run on a Release build printed
+`git : unknown (dirty)` and refused to write a record, citing *"git SHA could not be resolved."*
+Git was installed, the repository was right there, and `git log` worked fine from Windows.
+
+**Root cause.** Git's `safe.directory` protection. The repo lives on `/mnt/d`, so from inside WSL
+its ownership does not match the calling user, and git refuses to operate on it:
+
+```
+fatal: detected dubious ownership in repository at '/mnt/d/Placement Projects/VecCore'
+```
+
+This is a direct and predictable consequence of D2's cross-boundary layout — source on Windows,
+toolchain in Linux — and it will hit every git-touching tool in the project, not just the stamp.
+
+**Fix.** `git config --global --add safe.directory '/mnt/d/Placement Projects/VecCore'` inside WSL.
+One path, git's own prescribed remedy.
+
+**The interesting half, and the reason this is an entry rather than a footnote.** The fix took
+thirty seconds. Finding it took several minutes *only because the harness threw away the answer.*
+`capture_env` ran git with `2>/dev/null`, so when git failed it recorded `git_sha: "unknown"` and
+stopped. That is a true statement which hides the entire diagnosis — git had already printed both
+the cause and the exact command to fix it, and the code discarded it on the floor.
+
+`run()` now captures stderr into a `git_note` field, and `untrusted_reason()` surfaces it, so the
+refusal message names the real problem instead of the symptom.
+
+**Generalised lesson, and it is the one worth saying out loud in an interview:** *`2>/dev/null` on
+a command whose failure you handle gracefully is a decision to be told less than you were offered.*
+Graceful degradation and silent degradation are not the same thing. A field that can be missing
+should always carry *why* it is missing.
+
+**Worth noting as a design validation, not a bug.** `bench` did the right thing here — it refused
+to write a record it could not attribute to a commit, rather than writing one with a blank
+provenance field. That refusal is exactly what D10 rule 7 asks for, and it fired on its first real
+encounter with a problem.
 
 ---
 
