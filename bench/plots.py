@@ -52,6 +52,27 @@ def trusted(records: list[dict]) -> list[dict]:
     return keep
 
 
+#: Fields every plottable record must carry. Records written by an older build
+#: legitimately lack some of them -- results/bench.jsonl is append-only and
+#: outlives any single schema, which is the point of an audit trail (B-06).
+#: Skipping them is correct; crashing on them means one stale line from Phase 0
+#: can stop every plot in the repo from regenerating.
+REQUIRED = ("index", "index_params", "measurements", "n_base", "env")
+
+
+def plottable(records: list[dict]) -> list[dict]:
+    keep, skipped = [], 0
+    for r in records:
+        if all(k in r for k in REQUIRED):
+            keep.append(r)
+        else:
+            skipped += 1
+    if skipped:
+        missing = sorted({k for r in records for k in REQUIRED if k not in r})
+        print(f"  skipped {skipped} record(s) from an older schema (missing: {', '.join(missing)})")
+    return keep
+
+
 def recall_qps_curve(records: list[dict], out: Path) -> None:
     """The field-standard figure: recall on x, QPS on y, one point per ef_search."""
     hnsw = [r for r in records if r["index"] == "hnsw" and r["measurements"].get("recall_at_k")]
@@ -166,6 +187,7 @@ def markdown_table(records: list[dict], out: Path) -> None:
             continue
         rows.append({
             "index": r["index"],
+            "ef": p.get("ef_search", 0),
             "n": r["n_base"],
             "params": (f"M={p['M']} efC={p['ef_construction']} efS={p['ef_search']}"
                        if r["index"] == "hnsw" else "exact"),
@@ -177,7 +199,10 @@ def markdown_table(records: list[dict], out: Path) -> None:
             "mib": m.get("index_bytes", 0) / (1024 * 1024),
             "sha": r["env"]["git_sha"],
         })
-    rows.sort(key=lambda r: (r["n"], r["index"], r["params"]))
+    # Sort by ef_search numerically. Sorting the formatted string puts
+    # efS=160 between efS=10 and efS=20, which makes a monotone curve look
+    # scrambled in the one place a reader checks it by eye.
+    rows.sort(key=lambda r: (r["n"], r["index"], r["ef"]))
 
     lines = ["| index | n | params | recall@10 | QPS | p50 ms | p99 ms | index MiB | commit |",
              "|---|---|---|---|---|---|---|---|---|"]
@@ -205,9 +230,9 @@ def main() -> int:
 
     records = load(results)
     print(f"loaded {len(records)} record(s) from {results}")
-    records = trusted(records)
+    records = plottable(trusted(records))
     if not records:
-        raise SystemExit("no trusted records to plot")
+        raise SystemExit("no plottable records -- run bench first")
 
     recall_qps_curve(records, out)
     latency_distribution(records, out)
