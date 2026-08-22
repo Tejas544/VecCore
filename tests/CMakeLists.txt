@@ -12,7 +12,8 @@ FetchContent_MakeAvailable(doctest)
 
 add_executable(veccore_tests
   test_smoke.cpp
-  test_phase1.cpp)
+  test_phase1.cpp
+  test_hnsw.cpp)
 
 target_link_libraries(veccore_tests PRIVATE veccore doctest::doctest)
 
