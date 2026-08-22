@@ -29,7 +29,11 @@ story is what the interview is actually about.
 | # | Symptom | Class | Cost |
 |---|---|---|---|
 | B-01 | `TopK` kept the wrong id when distances tied | silent recall loss | ~5 min |
-| B-02 | Fetch script hung 10 min on a blocked port, writing 0 bytes | measurement that measured nothing | ~20 min |
+| B-02 | Fetch script hung 4h48m on a blocked port, writing 0 bytes | measurement that measured nothing | ~20 min |
+| B-03 | Trust check counted the harness's own output as a code change | unreproducible by construction | ~5 min |
+| B-04 | Reported `recall@10 0.253` from a truncated base vs full ground truth | measurement that measured nothing | ~2 min |
+| B-05 | Layout A/B showed the *naive* layout faster; it never reproduced the pathology | measurement that measured nothing | ~25 min |
+| B-06 | One Phase 0 record broke every plot; append-only file outlived its schema | untested code path | ~10 min |
 
 **Phase 0 scorecard:** 7 landmines defused, 0 confirmed bugs, ~1.5 h. Four of the seven
 (L-01, L-02, L-05, L-06) were found by checking a tool *before* depending on it rather than after.
@@ -222,6 +226,32 @@ positive one.** `02_VECCORE.md` calls this comparison "the best performance stor
 the story is better for having been wrong first, because "1.14× sequential, 1.67× random, and here
 is why the second number is the one that matters for HNSW" is a real answer, and "3–10× faster" is
 folklore.
+
+---
+
+### B-06 · One Phase 0 record stopped every plot in the repo regenerating · 2026-08-22 · Phase 2
+
+**Symptom:** `plots.py` died with `KeyError: 'index'` on a `results/bench.jsonl` holding 17 records,
+12 of which were perfectly good.
+
+**Root cause:** `results/` is **append-only by design** — that is the whole point of an audit trail,
+and D10 rule 7 depends on old records staying put so a README number can always be traced back. But
+the record schema has changed twice since Phase 0: `index`, `index_params` and `n_base` were all
+added later. The plotting code indexed those keys directly, so the oldest line in the file killed
+the newest figure.
+
+**Fix:** a `REQUIRED` tuple and a `plottable()` filter that skips records missing any of it, and
+*says how many it skipped and which fields were missing* — rather than silently dropping them,
+which would be the other way to get this wrong.
+
+**Cost:** ~10 minutes, and it would have recurred at every phase boundary. Phases 3, 4 and 5 each
+add fields.
+
+**The tension worth naming, because it is a real design trade and not just a bug:** an append-only
+results file and a strictly-typed reader are in direct conflict. You cannot have both permanent
+provenance and a schema you are free to change. The resolution is that **readers must be
+version-tolerant, and must announce what they ignored** — a silent skip is how a plot ends up
+missing half its data with nobody noticing. Same shape as L-07: degrade, but never silently.
 
 ---
 
