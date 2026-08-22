@@ -1,0 +1,324 @@
+# VecCore — Decision Log
+
+Every design decision, with the alternative that was rejected and the reason. Written as decisions
+are made, not reconstructed afterwards.
+
+**Why this file exists.** `00_FOUNDATIONS.md` §7 point 3: *"justify every design choice against the
+alternative you rejected, with a reason that isn't 'it was easier'."* In December, "I used a flat
+array for the adjacency lists" and "I used a flat array because pointer-chasing a graph is a cache
+disaster, here is the A/B I ran, and here is the case where I'd choose otherwise" are different
+answers from different candidates.
+
+**Status values:** `PROPOSED` (needs your sign-off) · `ACCEPTED` · `REVISED` (with the date and
+what changed) · `REJECTED`.
+
+**Same convention as EdgeRAG and QuantKit.** When a decision changes during the build, amend the
+entry — do not delete it. The revision history *is* the interview material.
+
+---
+
+## D1 · Schedule: Aug 21 evening → Aug 25, hard stop · **ACCEPTED** · 2026-08-21
+
+**Decision.** VecCore runs from tonight to end of Aug 25, then stops regardless of state. QuantKit's
+Phase 0 (scaffolding — `pyproject.toml`, repo layout, the bench harness skeleton; no algorithms, no
+GPU, no thinking-under-load) moves into evening slack during that window, so QuantKit opens on
+Aug 26 with its rails already laid.
+
+**Why not the plan of record (Aug 19–24).** Two of its six days are gone. Holding the Aug 24 end
+date means ~24 h against a scope `PLAN.md` §0.2 costs at 29.5–40 h, which forces cutting Phase 5
+(concurrency) — the single highest-value-per-hour item for an SDE panel and the one thing in this
+project that is neither ML nor an algorithm transcription.
+
+**Why not slip further than Aug 25.** QuantKit is already at or over budget on its own estimate,
+and it depends on Colab GPU availability, which VecCore does not. Spending QuantKit's slack twice
+is how both projects end up unfinished.
+
+**Why not abandon VecCore entirely and roll the days into QuantKit.** The portfolio currently has
+two ML-flavoured projects and no from-scratch systems project. VecCore is the one an interviewer
+who does not do ML can spend forty minutes on. That is the whole reason it is in the plan.
+
+**Rejected alternative worth naming: running both part-time in parallel.** QuantKit's own D10 calls
+this out as historically the worst option, and it is right — the C++ ramp and the GPTQ maths
+compete for the same scarce resource, which is uninterrupted thinking time, not hours.
+
+**Accepted 2026-08-21.** VecCore runs to end of Aug 25; QuantKit opens Aug 26 with its Phase 0
+already laid. `PLAN.md` is costed against ~30 h on this basis.
+
+**Sub-question resolved the same day: the Aug 15–18 modern-C++ ramp did happen.** So `PLAN.md`
+§0.5's inlined-ramp fallback does **not** apply, and §0.2's estimates hold as written. RAII, move
+semantics, memory layout, and `shared_mutex` are assumed available when the phases reach for them.
+If that turns out optimistic in practice — most likely at Phase 5, where memory ordering is the
+least-used corner of the ramp — amend this entry rather than silently absorbing the overrun.
+
+---
+
+## D2 · Build and measure in WSL2 Ubuntu, not MSYS2 or MSVC · **ACCEPTED** · 2026-08-21
+
+**Decision.** Source of truth stays at `D:\Placement Projects\VecCore` (one working copy, edited on
+Windows). All building, testing, and benchmarking happens inside WSL2 Ubuntu, with the **build
+directory and the datasets on the Linux filesystem**, not on `/mnt/d`.
+
+**Why.** Verified on this machine today, not assumed:
+
+| | WSL2 Ubuntu | MSYS2 UCRT64 | MSVC |
+|---|---|---|---|
+| ASan / UBSan | ✅ | ❌ **verified: fails to link** | ✅ |
+| TSan (Phase 5) | ✅ | ❌ | ❌ not supported on Windows at all |
+| valgrind / cachegrind | ✅ | ❌ | ❌ |
+| `pip install faiss-cpu` | ✅ | ⚠️ | ⚠️ |
+| pybind11 against CPython | ✅ | ❌ MinGW-built ext vs MSVC-built CPython is unsupported | ✅ |
+
+The deciding fact is **L-01** in `BUGS.md`: `-fsanitize=address,undefined` does not link under the
+local MSYS2 toolchain, and `02_VECCORE.md` §10 names sanitizers-from-commit-one as the *only*
+mitigation for "memory bugs eat a day." A mitigation that does not exist is worse than no
+mitigation, because the plan was built assuming it.
+
+**Why the build directory goes on ext4 and not next to the source.** `/mnt/d` crosses the 9p
+protocol bridge. Compilation and linking are dominated by many small file operations, and index
+build reads 512 MB of SIFT — putting either on the bridge means your build-time benchmark is partly
+a measurement of the filesystem bridge.
+
+**Why not two working copies (Windows for editing, WSL clone for building).** Hand-synced copies
+diverge, and a stale copy produces a bug that looks like a code bug. One copy, one truth.
+
+**Rejected: MSVC Build Tools.** It would give ASan and clean pybind11, but no TSan and no
+valgrind, and it costs ~6 GB and an hour of setup for a strictly smaller capability set.
+
+**Accepted 2026-08-21.** WSL2 Ubuntu it is. **Fallback if the install turns out to be blocked:**
+MSYS2 for the day-to-day build plus Colab for sanitizer runs and the FAISS baseline — which moves
+the FAISS comparison onto different hardware, weakening it materially. If it comes to that, the
+README must label the table as cross-machine. `PLAN.md` §0 timeboxes the WSL setup at 45 minutes;
+past 90 minutes with nothing compiling, take the fallback and log it here.
+
+---
+
+## D3 · SIFT1M for headline numbers, SIFT10K as the inner-loop fixture · **PROPOSED** · 2026-08-21
+
+**Decision.** Every unit test and every correctness check runs on the first 10,000 SIFT base
+vectors. SIFT1M appears only in `bench`, and only after a gate is green on 10K.
+
+**Why.** `02_VECCORE.md` names SIFT1M and is right to — it is the standard, it has published ground
+truth, and it is what the field's numbers are quoted on. What it does not say is that a full 1M
+HNSW build takes minutes. **A test suite that takes minutes stops being run**, which is EdgeRAG's
+D1 lesson, already learned once on this laptop. Test-cycle time is a first-class design concern,
+not a nicety.
+
+**Why SIFT and not something more modern.** Published ground truth is the entire point — it is what
+makes recall *measurable* rather than *asserted*, and it makes the FAISS comparison a comparison
+rather than two unconnected numbers. GIST1M (960-dim) is a reasonable stretch goal if Phase 2 lands
+early, because higher dimensionality changes the cache story; it is not worth a day.
+
+**Rejected: generating synthetic Gaussian vectors.** Faster to set up, and worthless — random
+vectors have no cluster structure, which is exactly the structure HNSW's neighbour heuristic
+exists to handle. You would get recall numbers that do not transfer to any real dataset.
+
+**Note:** synthetic data *is* used for one thing — the corpus-size crossover curve in Phase 6.3,
+where the question is "at what n does HNSW overtake brute force" and the answer only needs
+realistic dimensionality, not realistic structure. Say which is which in the README.
+
+---
+
+## D4 · Squared L2 as the primary metric; inner product supported, cosine by normalisation · **ACCEPTED** · 2026-08-21
+
+**Decision.** `l2_sqr` is the default and the one SIFT ground truth is defined against. Inner
+product is a second distance functor. Cosine is *not* a third implementation — it is inner product
+on L2-normalised vectors, normalised once at insert and once per query.
+
+**Why squared.** `sqrt` is monotonic, so it cannot change a ranking, and it is a genuinely
+expensive instruction to execute per candidate. Every serious implementation drops it. Say
+"squared L2" out loud rather than "L2" so it reads as deliberate.
+
+**Why cosine is not its own code path.** A third distance function is a third thing to keep correct
+and a third thing to test. Normalising at the boundary is one line and makes the equivalence
+explicit — which is itself the interview answer.
+
+**Consequence to watch:** with inner product, "larger is better" while for L2 "smaller is better."
+That sign flip has to be handled in exactly one place (the comparator), not sprinkled through the
+search. Getting it wrong produces P-04-shaped symptoms with a different cause.
+
+---
+
+## D5 · Flat arrays with fixed stride for both vectors and graph adjacency · **ACCEPTED** · 2026-08-21
+
+**Decision.** Vectors: one `std::vector<float>` of `n × d`, row-major. Adjacency: one
+`std::vector<uint32_t>` per level with stride `M_max + 1`, slot 0 holding the neighbour count.
+Never `vector<vector<...>>`.
+
+**Why.** This is the biggest single performance lever in the project and `02_VECCORE.md` says so
+twice. A vector-of-vectors is `n` separate heap allocations at unpredictable addresses: every
+access is a dependent load the prefetcher cannot anticipate, plus 24 bytes of header per row and
+the allocator's per-block overhead. The flat version streams, and a 128-dim float vector is exactly
+512 bytes — 8 cache lines, nothing wasted.
+
+**What we give up.** Fixed stride wastes memory for nodes below max degree (a node with 4
+neighbours still occupies `M_max + 1` slots), and growing the index means reallocating one large
+buffer rather than appending to small ones. Both are the right trade at this scale, and being able
+to state the cost is the difference between having made a decision and having copied one.
+
+**Commitment: measure it, do not just assert it.** Keep the naive variant behind a compile flag and
+A/B the brute-force scan once. `02_VECCORE.md` calls this "the best performance story in the
+project" and it costs twenty minutes. Use `cachegrind` for the cache-miss counts — WSL2 does not
+reliably expose hardware performance counters to `perf`, so a simulator is the honest tool here.
+
+---
+
+## D6 · The "from scratch" boundary · **ACCEPTED** · 2026-08-21
+
+**We own, and must be able to defend line by line:** the vector store, both distance functions,
+brute-force search, HNSW (insert, search, level assignment, the Algorithm 4 heuristic, the visited
+list), k-means and PQ codebooks, ADC, the BM25 inverted index and scorer, RRF, the locking scheme,
+and the benchmark harness.
+
+**We use:** the C++ standard library, CMake, doctest, pybind11, numpy and matplotlib for plotting,
+and **FAISS strictly as a benchmark baseline** — imported in `bench/faiss_baseline.py` and nowhere
+else in the repo.
+
+**Why this is the right line.** `02_VECCORE.md` §2 bans FAISS, hnswlib, Annoy, and ScaNN as
+*dependencies*. It does not ban standard-library containers, and writing my own `priority_queue`
+would demonstrate nothing that using `std::priority_queue` and explaining its heap property does
+not.
+
+**The one that will get probed: `std::priority_queue` in the HNSW search.** Be ready with: it is a
+binary heap over a `std::vector`, push and pop are O(log n), and *the reason there are two of them
+with opposite comparators* is the real content of the answer. If asked whether a custom flat
+bounded heap would be faster — yes, probably, because `ef` is small and known, so a sorted insertion
+into a fixed array can beat heap operations at that size. Say that; do not build it unless Phase 2
+finishes early.
+
+**Hard rule on hnswlib:** `02_VECCORE.md` permits reading it for C++ idiom. Read it *after* your
+implementation works, or not at all. Reading it while stuck converts a bug you would have diagnosed
+— and could have told a story about in December — into a line you copied.
+
+---
+
+## D7 · EdgeRAG integration: three honest claims, not one convenient one · **PROPOSED** · 2026-08-21
+
+**Decision.** The Phase 6.3 integration delivers:
+
+1. **`VecCoreIndex` implementing the existing `RetrievalIndex` protocol**, with recall identical to
+   `FlatIndex` on the 362-document corpus. The claim is **no regression** — that is the real and
+   sufficient result for the drop-in.
+2. **TF-IDF → BM25**, measured on EdgeRAG's 650 held-out queries. A genuine quality delta on a real
+   corpus, independent of scale.
+3. **A measured crossover curve** — brute force vs HNSW latency against corpus size on synthetic
+   data, with EdgeRAG's n=362 marked on it.
+
+**Why not the obvious claim ("HNSW makes EdgeRAG's retrieval faster").** Because it is false at
+n=362, where HNSW is *slower* — you pay graph traversal to avoid work that costs microseconds. The
+first interviewer to ask "at what corpus size?" would end that line of conversation badly. Recorded
+in full as landmine **L-03**.
+
+**Why BM25 is the substantive win here.** EdgeRAG's dense image-side signal was measured to be
+effectively noise (`DEFAULT_ALPHA = 0.0`, and `hybrid == text_only` bit-for-bit across 165 held-out
+queries), so its retrieval today is pure TF-IDF. BM25's term-frequency saturation and length
+normalisation are a real improvement over raw TF-IDF on short OCR text — and unlike the HNSW story,
+this one does not need scale to be true.
+
+**Honesty item to pre-register in the README:** EdgeRAG's retrieval has a documented **structural
+ceiling** — 112 of 362 documents have no OCR text at all and are unreachable by any text-based
+retriever, capping recall at ~37.6%. **Quote any BM25 improvement against that ceiling, not against
+100%.** Reporting "recall improved from 20% to 26%" without the ceiling invites exactly the
+criticism `WHAT_IS_THIS.md` §10 levels at other people.
+
+**The interface already exists**, which is worth pointing out in an interview: EdgeRAG's
+`RetrievalIndex` protocol docstring reads *"``VecCore`` implements this later without touching a
+caller."* Designing the seam before the implementation existed, and then having the implementation
+drop in without changing a caller, is the whole argument for the abstraction.
+
+---
+
+## D8 · Coarse `shared_mutex` first; fine-grained locking described, not built · **PROPOSED** · 2026-08-21
+
+**Decision.** One `std::shared_mutex` for the whole index. Readers take `shared_lock`, the inserter
+takes `unique_lock`. Be able to describe the finer-grained design — per-node link locks plus an
+atomic entry point, which is what hnswlib does — without shipping it.
+
+**Why.** Coarse and correct with a *measured* statement of where it hurts beats fine-grained and
+racy, every time, and that sentence is itself the interview answer. With ~30 h total, a subtle race
+in a graph mutation path is exactly the bug that eats a day and produces nothing presentable.
+
+**What must still be measured, because the honesty is the point:** read-only QPS at 1, 2, 4, 6, 8,
+and 12 threads. Those numbers are chosen deliberately for a 6-core/12-thread CPU — predict the
+shape before measuring (near-linear to 4, tailing by 6, well under linear at 8–12 because
+hyperthreads share execution units and the distance loop already saturates them), then show the
+plot. Predicting correctly and showing it is a much stronger story than the plot alone.
+
+**And the trap that goes with it (P-30):** do not write "it stops scaling because of lock
+contention" into the README without testing it. Re-run the sweep with the lock removed — read-only,
+so it will not crash — and if the curve is unchanged, it was memory bandwidth or hyperthreading,
+not the lock. A confident wrong explanation is worse than "I measured this and I am not certain
+why."
+
+---
+
+## D9 · Cut order extends the spec's by one item · **ACCEPTED** · 2026-08-21
+
+`02_VECCORE.md` §10 gives: cut reranking, then gRPC, then IVF. `PLAN.md` §0.3 keeps that ordering
+and continues it: **the FastAPI service is cut fourth**, before hand-written SIMD, before PQ's
+training-set size, and before concurrent insert.
+
+**Why the service goes before those.** The pybind11 module is the artifact that matters — it is
+what EdgeRAG calls, and it proves the C++/Python seam works. An HTTP wrapper on top of it adds one
+interview answer ("what does the network layer cost?") that can be given from a whiteboard. Forty-
+five minutes is cheap; forty-five minutes taken out of Phase 2 is not.
+
+**Never cut, and this list is not negotiable at 2 a.m.:** brute-force ground truth and the recall
+check against it, the `bench` harness, the neighbour-selection heuristic and the recall number
+proving it works, the `ef_search` sweep, the FAISS head-to-head, and `BUGS.md`/`CONTEXT.md`/the
+README's limitations section. Without the FAISS baseline there is no result — only an anecdote.
+
+---
+
+## D10 · Benchmark comparability rules · **ACCEPTED** · 2026-08-21
+
+Adapted from EdgeRAG's "no perf number from an untrusted device," with the substitution that here
+the CPU *is* the device.
+
+1. **One environment.** WSL2, `Release` (`-O3 -march=native -DNDEBUG`), stated thread count. FAISS
+   is measured in that same environment, in the same session, on the same data.
+2. **Interleave compared configurations** — A, B, A, B — never all-A-then-all-B. This is a mobile
+   CPU: run them in blocks and you are partly measuring how hot the laptop got.
+3. **≥5 trials, report the spread.** A single number is not a result.
+4. **Match on recall, not on parameters.** Comparing your `ef_search=64` to FAISS's default
+   `efSearch` is not a comparison. That is what the recall/QPS curve exists for.
+5. **Match thread counts explicitly.** `faiss.omp_set_num_threads(1)` against your single-threaded
+   number. FAISS defaults to every core, and comparing that to one thread is a 6× error in its
+   favour — and the first thing an interviewer will ask about.
+6. **Every JSON record is stamped** with git SHA, CPU model, compiler version, flags, thread count,
+   dataset, RNG seed, and every index parameter. A record missing those does not go in a plot.
+7. **Every number in the README traces to a record in `results/`.** If you cannot find the record,
+   delete the number.
+
+---
+
+## D11 · No hand-written SIMD unless it is measured to matter · **PROPOSED** · 2026-08-21
+
+**Decision.** Compile `-O3 -march=native`, verify with `-fopt-info-vec-optimized` that the distance
+loop actually vectorised, and report that. Write AVX2 intrinsics only if a measurement shows the
+compiler left something on the table *and* Phase 2 finished early.
+
+**Why.** `02_VECCORE.md` marks SIMD "optional, high value," and the high value is real — but it is
+the *understanding* that is valuable, not the code. On a simple contiguous `l2_sqr` loop, GCC 15
+with `-march=native` will emit good AVX2 (and this CPU has AVX-512, though it downclocks under
+sustained AVX-512 load, which is itself a talking point worth knowing). "I checked the generated
+code, confirmed it was already vectorised, and measured that hand intrinsics gained nothing" is a
+*better* answer than most hand-written SIMD — it demonstrates the same knowledge plus the judgement
+to not spend a day on it.
+
+**When this decision reverses:** if the auto-vectorisation report shows the loop was *not*
+vectorised — most likely due to an aliasing assumption the compiler could not prove — then try
+`__restrict` first, and only then reach for intrinsics.
+
+---
+
+## Decisions still open
+
+| # | Question | Blocks | When it must be answered |
+|---|---|---|---|
+| ~~D1~~ | ~~Schedule~~ | — | **Resolved 2026-08-21: Aug 25 hard stop** |
+| ~~D2~~ | ~~Build environment~~ | — | **Resolved 2026-08-21: WSL2 Ubuntu** |
+| ~~—~~ | ~~C++ ramp status~~ | — | **Resolved 2026-08-21: done; §0.5 does not apply** |
+| **D3** | SIFT10K fixture size — confirm at Phase 0 | Phase 1 tests | Phase 0 |
+| **D7** | Is the EdgeRAG integration still in scope if Phase 2 runs long? | Phase 6 | End of Aug 23 |
+| **D8** | Does concurrent *insert* ship, or only the read-scaling curve? | Phase 5 scope | Start of Phase 5 |
+| — | GIST1M as a second dataset? | Nothing — pure stretch | Only if Phase 2 lands early |
