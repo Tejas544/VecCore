@@ -28,7 +28,8 @@ story is what the interview is actually about.
 
 | # | Symptom | Class | Cost |
 |---|---|---|---|
-| — | *none yet — Phase 0 landmines are logged below as L-01..L-07* | | |
+| B-01 | `TopK` kept the wrong id when distances tied | silent recall loss | ~5 min |
+| B-02 | Fetch script hung 10 min on a blocked port, writing 0 bytes | measurement that measured nothing | ~20 min |
 
 **Phase 0 scorecard:** 7 landmines defused, 0 confirmed bugs, ~1.5 h. Four of the seven
 (L-01, L-02, L-05, L-06) were found by checking a tool *before* depending on it rather than after.
@@ -60,7 +61,76 @@ Classes worth labelling, because they are the categories an interviewer will rec
 
 ## Confirmed bugs
 
-*Empty. First entry expected in Phase 1 or 2.*
+### B-01 · The tie-break half of the heap comparator was backwards · 2026-08-22 · Phase 1
+
+**Symptom:** `TopK` returned ids `{7, 9}` where `{3, 7}` was correct, for three candidates offered
+at identical distance with k=2. Every test involving *distinct* distances passed.
+
+**Wrong theory:** none, and that is the point — the test named the failure precisely enough that
+there was no theorising to do. It cost about three minutes.
+
+**Root cause:** `WorseFirst` builds a max-heap whose `top()` must be the *worst* result, i.e. the
+eviction candidate. The distance clause was right (larger distance = worse = greater). The tie
+clause returned `a.id > b.id`, which makes the *largest* id compare as "best" and therefore puts
+the *smallest* id on top — so eviction threw away the id that should have been kept.
+
+**Diagnosis:** the failing test was written in the same commit as the code, specifically to pin
+tie-breaking, because P-12 predicts that ties at rank k produce recall like 0.997 and get
+misdiagnosed as an algorithm bug.
+
+**Fix:** `a.id < b.id`. Commit `see git log`.
+
+**Prevention:** `TEST_CASE("TopK breaks ties on the smaller id, deterministically (P-12)")`.
+
+**Cost:** ~5 minutes.
+
+**Why a five-minute bug gets an entry.** Because it is **P-04's exact failure class** — comparator
+polarity in a bounded heap — showing up in the simplest possible setting, where a hand-checkable
+test caught it instantly. In Phase 2 the same mistake lives inside HNSW's search loop, where there
+is no hand-checkable answer and the only symptom is that recall is quietly bad. The transferable
+lesson is not "check your comparator", it is: **when a comparator has two clauses, the second one
+is the one that will be wrong, and only a test with a deliberate tie will find it.** That test now
+exists, and the same test shape gets written for HNSW before the search loop does.
+
+---
+
+### B-02 · The fetch script hung indefinitely on a blocked port, writing nothing · 2026-08-22 · Phase 1
+
+**Symptom:** `scripts/fetch_sift.sh` ran for ten minutes producing `sift.tar.gz.part` at **0 bytes**,
+no output, no error, no progress bar.
+
+**Wrong theory:** that it was simply slow. A 168 MB download on a connection that had just pulled
+142 MB of apt packages at 6 MB/s should have finished in under a minute, so "slow" stopped being
+plausible quickly — but the script gave nothing to distinguish "slow" from "dead".
+
+**Root cause, two layers.** The outer one: `ftp.irisa.fr` is the canonical SIFT distribution and it
+is **FTP only**; outbound port 21 is blocked on this network, so the TCP connect never completed.
+The inner one, which is the actual bug in our code: `wget` was invoked with **no connect timeout**,
+so a blocked port presents as an indefinite hang rather than a failure.
+
+**Diagnosis:** `curl -sSI --connect-timeout 8` against the FTP URL returned
+`Operation timed out after 8002ms with 0 bytes received`, while an HTTP request to the same host's
+web server returned `206`. Host reachable, protocol blocked.
+
+**Fix:** the canonical source is now tried first with `--connect-timeout 15 --max-time 1800` so it
+fails fast, then falls back to an HTTPS mirror. Downloads show a progress bar.
+
+**Prevention:** every network call in this repo carries an explicit timeout.
+
+**On trusting the mirror**, because swapping in a third-party source for your benchmark corpus is
+not a small thing: the three files match the exact expected byte counts (516,000,000 / 5,160,000 /
+4,040,000 = `n * (4 + 4d)` for SIFT1M's known geometry), the reader validates every record's
+dimension (P-01), and — the strongest check — **Phase 1's gate is itself an authenticity test**:
+brute force over the base vectors must reproduce the *published* ground truth exactly. Data passing
+that is either real SIFT1M or an internally consistent forgery, and the latter is not a threat
+model that applies to a benchmark corpus.
+
+**Cost:** ~20 minutes, most of it spent believing the download was working.
+
+**Lesson, and it is the same one as L-07 wearing different clothes:** a network call without a
+timeout is not "patient", it is *unable to report failure*. Ten minutes of silence and zero bytes
+carried exactly as much information as an instant error would have — except the instant error also
+says what went wrong.
 
 ---
 

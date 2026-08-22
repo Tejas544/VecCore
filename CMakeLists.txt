@@ -112,7 +112,8 @@ configure_file(
 # are separate targets that depend on it, never the reverse (PLAN.md section 3).
 # ---------------------------------------------------------------------------
 add_library(veccore STATIC
-  src/stamp.cpp)
+  src/stamp.cpp
+  src/xvecs.cpp)
 
 target_include_directories(veccore PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"

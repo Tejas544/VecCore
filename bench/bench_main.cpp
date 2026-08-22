@@ -1,125 +1,310 @@
 // VecCore benchmark harness.
 //
-// 00_FOUNDATIONS.md section 4: "Before any feature work on any project, write
-// bench.py. [...] This ordering is not optional -- it's what turns a hobby
-// project into an engineering result."
+// 00_FOUNDATIONS.md section 4, applied literally:
+//   1. Warmup -- discard the first iterations.
+//   2. Percentiles, never a mean alone.
+//   3. >= 5 trials, report the spread.
+//   4. Fix everything you are not measuring, and say what was held constant.
+//   5. Always have a baseline.
+//   6. Report peak memory.
 //
-// Phase 0 ships the skeleton: argument parsing, the environment stamp, the
-// trusted-build gate, and incremental append to results/.  There is nothing to
-// time yet.  Phase 1 adds the timing loop (warmup, percentiles, trials) and the
-// first real measurement.
+// Plus CONTEXT.md D10 rule 2, which is specific to this machine: interleave
+// compared configurations A/B/A/B rather than running them in blocks. This is a
+// 6-core mobile CPU; run all of A then all of B and part of what you measured
+// is how hot the laptop got.
 
+#include "veccore/distance.hpp"
+#include "veccore/flat_index.hpp"
 #include "veccore/json.hpp"
+#include "veccore/metrics.hpp"
 #include "veccore/stamp.hpp"
+#include "veccore/storage.hpp"
+#include "veccore/xvecs.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <vector>
 
+using namespace veccore;
+
 namespace {
 
 struct Args {
-    std::string tag = "phase0_rails";
+    std::string tag = "flat";
     std::string out = "results/bench.jsonl";
-    std::string data_dir = ".";
+    std::string base;
+    std::string query;
+    std::string truth;
+    std::size_t k = 10;
+    std::size_t n_queries = 0;    // 0 = all
+    std::size_t max_base = 0;     // 0 = all
+    int trials = 5;
+    int warmup = 20;
+    bool layout_ab = false;
     bool allow_untrusted = false;
     bool help = false;
 };
+
+void usage() {
+    std::cout <<
+        "usage: bench --base F.fvecs --query F.fvecs [--truth F.ivecs] [options]\n"
+        "  --tag NAME          label for the record (default: flat)\n"
+        "  --out PATH          JSONL to append to (default: results/bench.jsonl)\n"
+        "  --k N               neighbours to retrieve (default: 10)\n"
+        "  --queries N         use only the first N queries (default: all)\n"
+        "  --max-base N        index only the first N base vectors (default: all)\n"
+        "  --trials N          repeat the full query set N times (default: 5)\n"
+        "  --warmup N          queries discarded before timing starts (default: 20)\n"
+        "  --layout-ab         also time the naive vector<vector<float>> layout (D5)\n"
+        "  --allow-untrusted   write a record from a Debug/sanitized/dirty build\n";
+}
 
 Args parse(int argc, char** argv) {
     Args a;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto next = [&](const char* what) -> std::string {
-            if (i + 1 >= argc) {
-                std::cerr << "bench: " << arg << " needs " << what << "\n";
-                std::exit(2);
-            }
+            if (i + 1 >= argc) { std::cerr << "bench: " << arg << " needs " << what << "\n"; std::exit(2); }
             return argv[++i];
         };
-        if (arg == "--tag")                   a.tag = next("a value");
-        else if (arg == "--out")              a.out = next("a path");
-        else if (arg == "--data-dir")         a.data_dir = next("a path");
-        else if (arg == "--allow-untrusted")  a.allow_untrusted = true;
+        if      (arg == "--tag")             a.tag = next("a value");
+        else if (arg == "--out")             a.out = next("a path");
+        else if (arg == "--base")            a.base = next("a path");
+        else if (arg == "--query")           a.query = next("a path");
+        else if (arg == "--truth")           a.truth = next("a path");
+        else if (arg == "--k")               a.k = std::stoul(next("a number"));
+        else if (arg == "--queries")         a.n_queries = std::stoul(next("a number"));
+        else if (arg == "--max-base")        a.max_base = std::stoul(next("a number"));
+        else if (arg == "--trials")          a.trials = std::stoi(next("a number"));
+        else if (arg == "--warmup")          a.warmup = std::stoi(next("a number"));
+        else if (arg == "--layout-ab")       a.layout_ab = true;
+        else if (arg == "--allow-untrusted") a.allow_untrusted = true;
         else if (arg == "-h" || arg == "--help") a.help = true;
-        else {
-            std::cerr << "bench: unknown argument '" << arg << "'\n";
-            std::exit(2);
-        }
+        else { std::cerr << "bench: unknown argument '" << arg << "'\n"; std::exit(2); }
     }
     return a;
 }
 
-void usage() {
-    std::cout <<
-        "usage: bench [options]\n"
-        "  --tag NAME           label for this record (default: phase0_rails)\n"
-        "  --out PATH           JSONL file to append to (default: results/bench.jsonl)\n"
-        "  --data-dir PATH      filesystem whose free space is stamped\n"
-        "  --allow-untrusted    write a record even from a Debug/sanitized/dirty build,\n"
-        "                       stamping trusted=false and the reason\n";
+using Clock = std::chrono::steady_clock;
+
+double ms_since(Clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     const Args args = parse(argc, argv);
-    if (args.help) {
+    if (args.help || args.base.empty() || args.query.empty()) {
         usage();
-        return 0;
+        return args.help ? 0 : 2;
     }
 
-    const veccore::EnvStamp env = veccore::capture_env(args.data_dir);
-
+    const EnvStamp env = capture_env(".");
     std::cout << "veccore bench\n"
               << "  cpu        : " << env.cpu_model << " (" << env.hw_threads << " threads)\n"
-              << "  kernel     : " << env.kernel << "\n"
               << "  build      : " << env.build_type << ", " << env.compiler << "\n"
               << "  flags      : " << env.cxx_flags << "\n"
-              << "  sanitizers : " << env.sanitizers << "\n"
-              << "  git        : " << env.git_sha << (env.git_dirty ? " (dirty)" : " (clean)") << "\n"
-              << "  free disk  : " << env.free_disk_gb << " GB\n";
+              << "  git        : " << env.git_sha << (env.git_dirty ? " (dirty)" : " (clean)") << "\n";
 
-    // D10 / EdgeRAG's rule, adapted: the untrustworthy thing in this project is
-    // not the machine, it is the *build*.  An ASan build runs several times
-    // slower than Release, and a latency copied out of one is indistinguishable
-    // from a real regression once it reaches a plot.
     if (!env.trusted()) {
         std::cout << "\n  NOT PUBLISHABLE: " << env.untrusted_reason() << "\n";
         if (!args.allow_untrusted) {
             std::cerr << "\nbench: refusing to write a record from an untrusted build.\n"
                       << "       Use a Release build with a clean tree, or pass --allow-untrusted\n"
-                      << "       (which stamps trusted=false so the record can never be mistaken\n"
-                      << "       for a publishable number).\n";
+                      << "       (which stamps trusted=false into the record).\n";
             return 1;
         }
-        std::cout << "  --allow-untrusted given: writing anyway, stamped trusted=false.\n";
+        std::cout << "  --allow-untrusted given: continuing, stamped trusted=false.\n";
     }
 
-    veccore::json::Object record;
-    record.str("tag", args.tag)
-          .str("phase", "0")
-          .raw("env", veccore::to_json(env));
+    // ---- load -------------------------------------------------------------
+    const auto t_load = Clock::now();
+    VectorStore base = read_fvecs(args.base, args.max_base);
+    VectorStore queries = read_fvecs(args.query, args.n_queries);
+    const double load_ms = ms_since(t_load);
 
-    // Phase 1 replaces this with real measurements: recall@k, QPS, p50/p95/p99,
-    // peak RSS, build time -- over >= 5 interleaved trials.
-    record.raw("measurements", "null")
-          .str("note", "Phase 0 rails: harness exists, no measurements yet");
+    if (base.dim() != queries.dim()) {
+        std::cerr << "bench: dimension mismatch -- base " << base.dim()
+                  << " vs query " << queries.dim() << "\n";
+        return 1;
+    }
+
+    IvecsData truth;
+    if (!args.truth.empty()) {
+        truth = read_ivecs(args.truth, args.n_queries);
+        if (truth.rows() < queries.size()) {
+            std::cerr << "bench: ground truth has " << truth.rows() << " rows but there are "
+                      << queries.size() << " queries\n";
+            return 1;
+        }
+        if (truth.width < args.k) {
+            std::cerr << "bench: ground truth is " << truth.width << " wide, k=" << args.k << "\n";
+            return 1;
+        }
+    }
+
+    std::cout << "\n  base       : " << base.size() << " x " << base.dim()
+              << "  (" << base.bytes() / (1024.0 * 1024.0) << " MiB)\n"
+              << "  queries    : " << queries.size() << "\n"
+              << "  k          : " << args.k << "\n"
+              << "  truth      : " << (args.truth.empty() ? "none" : args.truth) << "\n"
+              << "  load       : " << load_ms << " ms\n\n";
+
+    const FlatL2 index(base);
+
+    // ---- warmup -----------------------------------------------------------
+    // Rule 1. The first queries page in 512 MB of base vectors from the page
+    // cache and prime the branch predictors; timing them measures the operating
+    // system, not the index.
+    const auto warm = static_cast<std::size_t>(args.warmup);
+    for (std::size_t i = 0; i < warm && i < queries.size(); ++i) {
+        volatile auto sink = index.search(queries.at(static_cast<vec_id_t>(i)), args.k).size();
+        (void)sink;
+    }
+
+    // ---- measure ----------------------------------------------------------
+    std::vector<double> all_latencies_ms;
+    std::vector<double> qps_per_trial;
+    std::vector<double> recall_per_trial;
+    all_latencies_ms.reserve(queries.size() * static_cast<std::size_t>(args.trials));
+
+    for (int trial = 0; trial < args.trials; ++trial) {
+        double hits = 0.0;
+        const auto t_trial = Clock::now();
+
+        for (vec_id_t q = 0; q < queries.size(); ++q) {
+            const auto t0 = Clock::now();
+            const std::vector<Neighbor> got = index.search(queries.at(q), args.k);
+            all_latencies_ms.push_back(ms_since(t0));
+
+            if (!args.truth.empty()) {
+                hits += recall_at_k(got, truth.row(q), args.k);
+            }
+        }
+
+        const double trial_ms = ms_since(t_trial);
+        qps_per_trial.push_back(static_cast<double>(queries.size()) / (trial_ms / 1000.0));
+        if (!args.truth.empty()) {
+            recall_per_trial.push_back(hits / static_cast<double>(queries.size()));
+        }
+        std::cout << "  trial " << (trial + 1) << "/" << args.trials
+                  << "  " << qps_per_trial.back() << " QPS";
+        if (!recall_per_trial.empty()) std::cout << "  recall@" << args.k << " " << recall_per_trial.back();
+        std::cout << "\n";
+    }
+
+    const LatencyStats lat = LatencyStats::from(all_latencies_ms);
+    const double qps_mean = mean_of(qps_per_trial);
+    const double qps_sd = stddev(qps_per_trial);
+
+    std::cout << std::fixed << std::setprecision(4)
+              << "\n  QPS        : " << qps_mean << " +/- " << qps_sd
+              << "  (" << (qps_sd / (qps_mean ? qps_mean : 1.0) * 100.0) << "% rsd, "
+              << args.trials << " trials)\n"
+              << "  latency ms : p50 " << lat.p50 << "  p95 " << lat.p95 << "  p99 " << lat.p99
+              << "  max " << lat.max << "\n";
+    if (!recall_per_trial.empty()) {
+        std::cout << "  recall@" << args.k << "   : " << mean_of(recall_per_trial) << "\n";
+    }
+    std::cout << "  peak RSS   : " << peak_rss_mib() << " MiB"
+              << "   (index data alone: " << base.bytes() / (1024.0 * 1024.0) << " MiB)\n";
+
+    // ---- optional D5 A/B: flat vs pointer-chasing --------------------------
+    // Interleaved, per D10 rule 2 -- alternating flat/naive/flat/naive so
+    // thermal drift hits both arms equally instead of penalising whichever ran
+    // second.
+    double naive_qps = 0.0, flat_qps_ab = 0.0;
+    offset_t naive_bytes = 0;
+    if (args.layout_ab) {
+        NaiveVectorStore naive(base.dim());
+        for (vec_id_t i = 0; i < base.size(); ++i) naive.add(base.at(i));
+        naive_bytes = naive.bytes();
+
+        const std::size_t n_ab = std::min<std::size_t>(queries.size(), 200);
+        std::vector<double> flat_ms, naive_ms;
+        const L2Sqr dist;
+
+        for (int round = 0; round < args.trials; ++round) {
+            {
+                const auto t0 = Clock::now();
+                for (std::size_t q = 0; q < n_ab; ++q) {
+                    TopK top(args.k);
+                    const float* qv = queries.at(static_cast<vec_id_t>(q));
+                    for (vec_id_t i = 0; i < base.size(); ++i) top.offer(dist(qv, base.at(i), base.dim()), i);
+                    volatile auto s = top.size(); (void)s;
+                }
+                flat_ms.push_back(ms_since(t0));
+            }
+            {
+                const auto t0 = Clock::now();
+                for (std::size_t q = 0; q < n_ab; ++q) {
+                    TopK top(args.k);
+                    const float* qv = queries.at(static_cast<vec_id_t>(q));
+                    for (vec_id_t i = 0; i < naive.size(); ++i) top.offer(dist(qv, naive.at(i), naive.dim()), i);
+                    volatile auto s = top.size(); (void)s;
+                }
+                naive_ms.push_back(ms_since(t0));
+            }
+        }
+
+        flat_qps_ab = static_cast<double>(n_ab) / (mean_of(flat_ms) / 1000.0);
+        naive_qps  = static_cast<double>(n_ab) / (mean_of(naive_ms) / 1000.0);
+        std::cout << "\n  layout A/B (D5), " << n_ab << " queries x " << args.trials << " interleaved rounds:\n"
+                  << "    flat  : " << flat_qps_ab << " QPS   " << base.bytes() / (1024.0 * 1024.0) << " MiB\n"
+                  << "    naive : " << naive_qps  << " QPS   " << naive_bytes / (1024.0 * 1024.0) << " MiB\n"
+                  << "    ratio : " << (naive_qps > 0.0 ? flat_qps_ab / naive_qps : 0.0) << "x\n";
+    }
+
+    // ---- record -----------------------------------------------------------
+    json::Object m;
+    m.num("k", static_cast<long long>(args.k))
+     .num("n_base", static_cast<long long>(base.size()))
+     .num("n_queries", static_cast<long long>(queries.size()))
+     .num("dim", static_cast<long long>(base.dim()))
+     .num("trials", static_cast<long long>(args.trials))
+     .num("warmup", static_cast<long long>(args.warmup))
+     .num("qps_mean", qps_mean)
+     .num("qps_stddev", qps_sd)
+     .array("qps_per_trial", qps_per_trial)
+     .num("latency_p50_ms", lat.p50)
+     .num("latency_p95_ms", lat.p95)
+     .num("latency_p99_ms", lat.p99)
+     .num("latency_mean_ms", lat.mean)
+     .num("latency_max_ms", lat.max)
+     .num("index_bytes", static_cast<long long>(base.bytes()))
+     .num("peak_rss_mib", peak_rss_mib())
+     .num("load_ms", load_ms);
+
+    if (!recall_per_trial.empty()) {
+        m.num("recall_at_k", mean_of(recall_per_trial));
+    } else {
+        m.raw("recall_at_k", "null");
+    }
+    if (args.layout_ab) {
+        m.num("ab_flat_qps", flat_qps_ab)
+         .num("ab_naive_qps", naive_qps)
+         .num("ab_naive_bytes", static_cast<long long>(naive_bytes));
+    }
+
+    json::Object record;
+    record.str("tag", args.tag)
+          .str("phase", "1")
+          .str("index", "flat_l2_exact")
+          .str("dataset_base", args.base)
+          .str("dataset_query", args.query)
+          .str("dataset_truth", args.truth)
+          .raw("env", to_json(env))
+          .raw("measurements", m.str());
 
     std::ofstream out(args.out, std::ios::app);
-    if (!out) {
-        std::cerr << "bench: cannot open " << args.out << " for append\n";
-        return 1;
-    }
-    // JSONL, appended incrementally.  00_FOUNDATIONS.md section 3 rule 5: a
-    // disconnect at hour 3 must not cost hours 1 and 2.
+    if (!out) { std::cerr << "bench: cannot open " << args.out << "\n"; return 1; }
     out << record.str() << '\n';
-    if (!out.good()) {
-        std::cerr << "bench: write to " << args.out << " failed\n";
-        return 1;
-    }
+    if (!out.good()) { std::cerr << "bench: write failed\n"; return 1; }
 
     std::cout << "\n  wrote 1 record to " << args.out << "\n";
     return 0;
