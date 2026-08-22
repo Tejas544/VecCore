@@ -134,6 +134,82 @@ says what went wrong.
 
 ---
 
+### B-04 · bench reported a recall number that could not mean anything · 2026-08-22 · Phase 1
+
+**Symptom:** `--max-base 200000 --truth sift_groundtruth.ivecs` printed `recall@10 0.253`, three
+times, stable to the digit.
+
+**Wrong theory:** briefly, that something was badly wrong with the search — 0.253 from code that
+had just scored a verified-exact 1.0 is alarming. It is also stable across trials, which makes it
+look like a deterministic bug rather than noise.
+
+**Root cause:** not a bug in the search at all. `--max-base 200000` indexes the first fifth of the
+corpus, while `sift_groundtruth.ivecs` lists true neighbours drawn from **all one million**. Roughly
+four fifths of the correct answers were not in the index to be found. The search returned the best
+available answer, correctly, and the recall number described the flag combination rather than the
+code.
+
+**Fix:** `bench` now refuses `--truth` together with a truncating `--max-base`, and says why.
+
+**Why this is the most dangerous bug in the phase despite taking two minutes to find.** It is
+`00_FOUNDATIONS.md` §4's warning made concrete: a number that is stable, reproducible, plausible,
+and meaningless. Had it been slightly less alarming — 0.94 instead of 0.253 — it would have gone
+straight into a results file, and nothing downstream would ever have questioned it. **The reason it
+was caught is that it was absurd, which is luck, not process.** The guard is the process.
+
+---
+
+### B-05 · The layout benchmark did not reproduce the effect it was built to demonstrate · 2026-08-22 · Phase 1
+
+**Symptom:** the D5 flat-vs-pointer-chasing A/B reported the *naive* layout as **faster**:
+`flat 61.9 QPS, naive 63.9 QPS, ratio 0.969x`. The repo's own design rationale says flat should win
+comfortably.
+
+**Wrong theory:** that D5 was wrong and the flat layout does not help. It was tempting — there was
+a measurement sitting right there saying so.
+
+**Root cause, two independent problems, both in the benchmark:**
+
+1. **The naive store was not actually fragmented.** It was built by one uninterrupted loop of
+   200,000 identically-sized allocations, and `malloc` served them from the same arena in address
+   order. So "pointer-chasing" was, in memory, very nearly contiguous — plus an indirection through
+   a pointer array that is itself contiguous and therefore prefetchable. The benchmark constructed
+   the *best possible case* for the layout it was meant to indict.
+2. **It only measured sequential access.** A brute-force scan walks ids `0..n` in order, and the
+   hardware prefetcher handles that well for *both* layouts. The layout argument was never really
+   about sequential scans.
+
+**Fix:** interleave ballast allocations while building the naive store, and measure sequential
+*and* shuffled access order as separate arms, all four interleaved per round.
+
+**Result, on 200,000 SIFT vectors (98 MiB, comfortably past this CPU's 12 MB L3):**
+
+| access pattern | flat | naive (fragmented) | flat advantage |
+|---|---|---|---|
+| sequential | 62.7 QPS | 54.8 QPS | **1.14×** |
+| random | 25.3 QPS | 15.1 QPS | **1.67×** |
+
+**What it actually says, which is better than what we set out to prove.** The layout advantage is
+modest for a sequential scan and substantial under random access — **and random access is what HNSW
+does.** Graph traversal visits neighbours in an order no prefetcher can anticipate, so the
+dependent pointer load costs a full DRAM round trip that a flat array's computed offset does not.
+Note also that random access costs flat 2.5× and naive 3.6× relative to their own sequential
+numbers: the penalty for unpredictable access is real for both, and *worse* for the layout with an
+extra indirection.
+
+**Cost:** ~25 minutes.
+
+**The lesson, and it is P-30 caught in the act.** The first benchmark did not measure a false thing;
+it measured a true thing about a situation that does not occur. A microbenchmark that avoids the
+conditions the effect depends on will faithfully report no effect, and it looks exactly like
+evidence. **Before believing a null result, check that the experiment could have produced a
+positive one.** `02_VECCORE.md` calls this comparison "the best performance story in the project" —
+the story is better for having been wrong first, because "1.14× sequential, 1.67× random, and here
+is why the second number is the one that matters for HNSW" is a real answer, and "3–10× faster" is
+folklore.
+
+---
+
 ## Defused landmines
 
 Things that would have cost hours, caught before they did. **These count.** "I checked whether my

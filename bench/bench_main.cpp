@@ -21,11 +21,14 @@
 #include "veccore/storage.hpp"
 #include "veccore/xvecs.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -136,6 +139,20 @@ int main(int argc, char** argv) {
 
     IvecsData truth;
     if (!args.truth.empty()) {
+        // B-04. Ground truth is computed against a specific base set. Index a
+        // subset of it and the published neighbours mostly are not in the
+        // index, so recall collapses for a reason that has nothing to do with
+        // the search -- and it reports a number that looks like a result.
+        // 00_FOUNDATIONS.md section 4: a benchmark that measures nothing is
+        // worse than no benchmark, because someone will quote it.
+        const XvecsHeader full = xvecs_header(args.base);
+        if (base.size() < full.count) {
+            std::cerr << "bench: --max-base " << base.size() << " truncates a "
+                      << full.count << "-vector base, but --truth is ground truth for the\n"
+                      << "       FULL base. Recall against it would be meaningless.\n"
+                      << "       Either drop --max-base, or drop --truth and measure speed only.\n";
+            return 1;
+        }
         truth = read_ivecs(args.truth, args.n_queries);
         if (truth.rows() < queries.size()) {
             std::cerr << "bench: ground truth has " << truth.rows() << " rows but there are "
@@ -218,46 +235,85 @@ int main(int argc, char** argv) {
     // Interleaved, per D10 rule 2 -- alternating flat/naive/flat/naive so
     // thermal drift hits both arms equally instead of penalising whichever ran
     // second.
-    double naive_qps = 0.0, flat_qps_ab = 0.0;
+    double ab_flat_seq = 0.0, ab_naive_seq = 0.0, ab_flat_rand = 0.0, ab_naive_rand = 0.0;
     offset_t naive_bytes = 0;
     if (args.layout_ab) {
+        // The naive store is built with junk allocations interleaved between
+        // the rows. Without that, malloc hands out 200k identically-sized
+        // blocks consecutively and the "pointer-chasing" layout is contiguous
+        // in practice -- which is why the first version of this benchmark
+        // measured no difference at all (B-05). Real heaps are not built by a
+        // single uninterrupted loop.
         NaiveVectorStore naive(base.dim());
-        for (vec_id_t i = 0; i < base.size(); ++i) naive.add(base.at(i));
+        std::vector<std::vector<float>> ballast;
+        ballast.reserve(base.size());
+        for (vec_id_t i = 0; i < base.size(); ++i) {
+            naive.add(base.at(i));
+            ballast.emplace_back(base.dim() / 2);  // fragment the arena
+        }
         naive_bytes = naive.bytes();
 
-        const std::size_t n_ab = std::min<std::size_t>(queries.size(), 200);
-        std::vector<double> flat_ms, naive_ms;
+        const std::size_t n_ab = std::min<std::size_t>(queries.size(), 100);
         const L2Sqr dist;
 
+        // Sequential order vs a fixed shuffle. This is the comparison that
+        // actually matters for Phase 2: a brute-force scan walks ids 0..n in
+        // order, and the hardware prefetcher handles that well for BOTH
+        // layouts. HNSW does not -- graph traversal visits neighbours in an
+        // order the prefetcher cannot predict, and that is where a dependent
+        // pointer load costs a full DRAM round trip.
+        std::vector<vec_id_t> order(base.size());
+        std::iota(order.begin(), order.end(), 0u);
+        std::vector<vec_id_t> shuffled = order;
+        std::mt19937 rng(42);  // seeded: D10, the sweep must be reproducible
+        std::shuffle(shuffled.begin(), shuffled.end(), rng);
+
+        auto scan_flat = [&](const std::vector<vec_id_t>& ord) {
+            const auto t0 = Clock::now();
+            for (std::size_t q = 0; q < n_ab; ++q) {
+                TopK top(args.k);
+                const float* qv = queries.at(static_cast<vec_id_t>(q));
+                for (const vec_id_t i : ord) top.offer(dist(qv, base.at(i), base.dim()), i);
+                volatile auto s = top.size(); (void)s;
+            }
+            return ms_since(t0);
+        };
+        auto scan_naive = [&](const std::vector<vec_id_t>& ord) {
+            const auto t0 = Clock::now();
+            for (std::size_t q = 0; q < n_ab; ++q) {
+                TopK top(args.k);
+                const float* qv = queries.at(static_cast<vec_id_t>(q));
+                for (const vec_id_t i : ord) top.offer(dist(qv, naive.at(i), naive.dim()), i);
+                volatile auto s = top.size(); (void)s;
+            }
+            return ms_since(t0);
+        };
+
+        std::vector<double> fs, ns, fr, nr;
         for (int round = 0; round < args.trials; ++round) {
-            {
-                const auto t0 = Clock::now();
-                for (std::size_t q = 0; q < n_ab; ++q) {
-                    TopK top(args.k);
-                    const float* qv = queries.at(static_cast<vec_id_t>(q));
-                    for (vec_id_t i = 0; i < base.size(); ++i) top.offer(dist(qv, base.at(i), base.dim()), i);
-                    volatile auto s = top.size(); (void)s;
-                }
-                flat_ms.push_back(ms_since(t0));
-            }
-            {
-                const auto t0 = Clock::now();
-                for (std::size_t q = 0; q < n_ab; ++q) {
-                    TopK top(args.k);
-                    const float* qv = queries.at(static_cast<vec_id_t>(q));
-                    for (vec_id_t i = 0; i < naive.size(); ++i) top.offer(dist(qv, naive.at(i), naive.dim()), i);
-                    volatile auto s = top.size(); (void)s;
-                }
-                naive_ms.push_back(ms_since(t0));
-            }
+            fs.push_back(scan_flat(order));       // interleaved A/B/C/D per round,
+            ns.push_back(scan_naive(order));      // so thermal drift hits every arm
+            fr.push_back(scan_flat(shuffled));    // equally rather than penalising
+            nr.push_back(scan_naive(shuffled));   // whichever ran last (D10 rule 2)
         }
 
-        flat_qps_ab = static_cast<double>(n_ab) / (mean_of(flat_ms) / 1000.0);
-        naive_qps  = static_cast<double>(n_ab) / (mean_of(naive_ms) / 1000.0);
-        std::cout << "\n  layout A/B (D5), " << n_ab << " queries x " << args.trials << " interleaved rounds:\n"
-                  << "    flat  : " << flat_qps_ab << " QPS   " << base.bytes() / (1024.0 * 1024.0) << " MiB\n"
-                  << "    naive : " << naive_qps  << " QPS   " << naive_bytes / (1024.0 * 1024.0) << " MiB\n"
-                  << "    ratio : " << (naive_qps > 0.0 ? flat_qps_ab / naive_qps : 0.0) << "x\n";
+        const auto qps = [&](const std::vector<double>& ms) {
+            return static_cast<double>(n_ab) / (mean_of(ms) / 1000.0);
+        };
+        ab_flat_seq   = qps(fs);
+        ab_naive_seq  = qps(ns);
+        ab_flat_rand  = qps(fr);
+        ab_naive_rand = qps(nr);
+
+        std::cout << "\n  layout A/B (D5), " << n_ab << " queries x " << args.trials
+                  << " interleaved rounds, " << base.size() << " vectors:\n"
+                  << "                      flat        naive(frag)   flat/naive\n"
+                  << "    sequential : " << ab_flat_seq << "   " << ab_naive_seq
+                  << "   " << (ab_naive_seq > 0 ? ab_flat_seq / ab_naive_seq : 0.0) << "x\n"
+                  << "    random     : " << ab_flat_rand << "   " << ab_naive_rand
+                  << "   " << (ab_naive_rand > 0 ? ab_flat_rand / ab_naive_rand : 0.0) << "x\n"
+                  << "    memory     : " << base.bytes() / (1024.0 * 1024.0) << " MiB   "
+                  << naive_bytes / (1024.0 * 1024.0) << " MiB\n";
     }
 
     // ---- record -----------------------------------------------------------
@@ -286,8 +342,10 @@ int main(int argc, char** argv) {
         m.raw("recall_at_k", "null");
     }
     if (args.layout_ab) {
-        m.num("ab_flat_qps", flat_qps_ab)
-         .num("ab_naive_qps", naive_qps)
+        m.num("ab_flat_seq_qps", ab_flat_seq)
+         .num("ab_naive_seq_qps", ab_naive_seq)
+         .num("ab_flat_rand_qps", ab_flat_rand)
+         .num("ab_naive_rand_qps", ab_naive_rand)
          .num("ab_naive_bytes", static_cast<long long>(naive_bytes));
     }
 

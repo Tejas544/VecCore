@@ -160,6 +160,41 @@ A/B the brute-force scan once. `02_VECCORE.md` calls this "the best performance 
 project" and it costs twenty minutes. Use `cachegrind` for the cache-miss counts — WSL2 does not
 reliably expose hardware performance counters to `perf`, so a simulator is the honest tool here.
 
+### REVISED 2026-08-22 — measured, and the honest number is smaller than the folklore
+
+Run on 200,000 SIFT vectors (98 MiB, comfortably past this CPU's 12 MB L3), 100 queries, 3
+interleaved rounds. Record: `results/bench.jsonl`, tag `layout_ab_200k`.
+
+| access pattern | flat | naive (fragmented) | flat advantage |
+|---|---|---|---|
+| sequential | 62.7 QPS | 54.8 QPS | **1.14×** |
+| random | 25.3 QPS | 15.1 QPS | **1.67×** |
+
+**The decision stands; the *argument* for it changes.** The claim "flat is 3–10× faster" — which is
+what the folklore says and what this entry originally implied — **is not what this machine
+measures.** What it measures is:
+
+- **For a sequential scan, layout barely matters (1.14×).** The prefetcher handles both, because a
+  contiguous array of pointers is itself perfectly predictable to walk.
+- **Under random access the gap widens to 1.67×**, and *that* is the case this project actually
+  cares about: brute force scans in order, but **HNSW does not**. Graph traversal visits neighbours
+  in an order no prefetcher can anticipate, so a dependent pointer load costs a full DRAM round
+  trip that a computed offset into a flat array does not.
+- Random access costs the flat layout 2.5× against its own sequential number and the naive layout
+  3.6×. The penalty for unpredictable access is large for both and *worse* for the layout carrying
+  an extra indirection — which is the mechanism, stated in numbers.
+
+**Two things had to be fixed before the benchmark could see any of this**, and both are recorded as
+B-05: the naive store was built by one uninterrupted allocation loop, so `malloc` laid it out very
+nearly contiguously and the "bad" layout was not bad; and only sequential access was being timed,
+which is the case where the effect is smallest. The first version of the experiment reported the
+naive layout as *faster*.
+
+**Say the measured numbers, not the folklore.** "1.14× sequential, 1.67× random, and the second is
+the one that matters because HNSW traverses a graph" is a defensible answer that invites a good
+follow-up. "3–10×" is a number from a blog post, and the first interviewer who asks how it was
+measured will find out it was not.
+
 ---
 
 ## D6 · The "from scratch" boundary · **ACCEPTED** · 2026-08-21
