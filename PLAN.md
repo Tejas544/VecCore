@@ -256,7 +256,7 @@ on a 3½-day budget, debugging two layers at once is how days disappear.
 |---|---|
 | 0 | ✅ **PASSED 2026-08-21.** `asan_probe` aborts with a heap-buffer-overflow report; 22 tests green; `bench` writes a trusted record |
 | 1 | ✅ **PASSED 2026-08-22.** Brute force = 1.0000 recall@10 vs the SIFT10K fixture (5 trials). On full SIFT1M vs the *published* ground truth: 0.9995, and every disagreement proven to be an exact distance tie (`scripts/diagnose_recall.py`), which is the real criterion — an exact id match is unachievable where the data ties. `bench` writes stamped JSON records |
-| 2 | HNSW **recall@10 ≥ 0.95** on SIFT10K at some `ef_search`, verified against Phase 1's ground truth |
+| 2 | ✅ **PASSED 2026-08-22.** SIFT10K: 0.9952 @ ef=40. **SIFT1M: 0.9755 @ ef=80, 1,934 QPS — 150× brute force.** Recall monotone in `ef_search` across the whole sweep; level histogram matches 1/M to three decimals; 37/37 tests green under ASan+UBSan |
 | 3 | PQ reconstruction error decreases monotonically as `m` grows; ADC recall@10 ≥ 0.80 at 16× compression |
 | 4 | BM25 reproduces a hand-computed score on a 3-document toy corpus to 6 decimal places |
 | 5 | 4-thread read QPS ≥ 3× single-thread; TSan clean under concurrent read + insert |
