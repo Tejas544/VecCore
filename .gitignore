@@ -1,0 +1,27 @@
+# Build output -- lives at ~/veccore-build on the Linux filesystem (D2), never here.
+build/
+build-*/
+cmake-build-*/
+compile_commands.json
+
+# Datasets -- live at ~/veccore-data (D2).  SIFT1M is ~500 MB extracted.
+data/*
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# results/ is COMMITTED on purpose (PLAN.md section 3): every number in the
+# README traces to a JSON record with the git SHA that produced it.  Only the
+# scratch subdirectory is ignored.
+results/scratch/
