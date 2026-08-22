@@ -96,8 +96,10 @@ exists, and the same test shape gets written for HNSW before the search loop doe
 
 ### B-02 · The fetch script hung indefinitely on a blocked port, writing nothing · 2026-08-22 · Phase 1
 
-**Symptom:** `scripts/fetch_sift.sh` ran for ten minutes producing `sift.tar.gz.part` at **0 bytes**,
-no output, no error, no progress bar.
+**Symptom:** `scripts/fetch_sift.sh` produced `sift.tar.gz.part` at **0 bytes**, with no output, no
+error, and no progress bar. It was noticed after ten minutes. It was finally killed **4 hours and
+48 minutes later**, still running, still at zero bytes — it had been left alive while the mirror
+fallback was written and all of Phase 1 was built on top of it.
 
 **Wrong theory:** that it was simply slow. A 168 MB download on a connection that had just pulled
 142 MB of apt packages at 6 MB/s should have finished in under a minute, so "slow" stopped being
@@ -125,12 +127,25 @@ brute force over the base vectors must reproduce the *published* ground truth ex
 that is either real SIFT1M or an internally consistent forgery, and the latter is not a threat
 model that applies to a benchmark corpus.
 
-**Cost:** ~20 minutes, most of it spent believing the download was working.
+**A second, operational half, found when it was finally killed.** Stopping the *task* did not stop
+the download: the `wget` had been orphaned and survived as PID 3966 inside the WSL distro, still
+blocked on connect. Killing a shell that spawned a child kills the shell. `pkill -f` was needed to
+actually end it. Any future long-running job in this project gets checked with `pgrep` after it is
+stopped, not assumed dead.
+
+**Cost:** ~20 minutes of attention. **4 h 48 m of wall-clock**, during which a process sat holding a
+socket and a zero-byte file, contributing nothing and reporting nothing.
 
 **Lesson, and it is the same one as L-07 wearing different clothes:** a network call without a
-timeout is not "patient", it is *unable to report failure*. Ten minutes of silence and zero bytes
-carried exactly as much information as an instant error would have — except the instant error also
-says what went wrong.
+timeout is not "patient", it is *unable to report failure*. Nearly five hours of silence and zero
+bytes carried exactly as much information as an instant error would have — except the instant error
+also says what went wrong, and stops.
+
+**The sharper version, which is what makes this worth telling:** the failure was diagnosed and
+routed around within twenty minutes, the dataset was downloaded from a mirror, and Phase 1 was
+built and gated on it — *while the original hung process was still sitting there*. A silent failure
+does not become loud just because you have solved the problem it caused. It has to be reaped
+explicitly, and nothing in the tooling was going to remind anyone.
 
 ---
 
