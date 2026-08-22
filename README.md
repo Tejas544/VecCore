@@ -50,10 +50,20 @@ imaginary:
 ~/veccore-build-debug/bin/asan_probe
 ```
 
+Python side — Ubuntu 24.04 enforces PEP 668, so this needs a venv rather than a bare
+`pip install`:
+
+```bash
+python3 -m venv ~/veccore-venv && ~/veccore-venv/bin/pip install numpy matplotlib faiss-cpu pybind11
+```
+
+FAISS is a **benchmark, not a dependency** (`02_VECCORE.md` §2). It is imported only by
+`bench/faiss_baseline.py`, never by anything in `include/` or `src/`.
+
 ## Data
 
 ```bash
-bash scripts/fetch_sift.sh && python3 scripts/make_fixture.py
+bash scripts/fetch_sift.sh && ~/veccore-venv/bin/python scripts/make_fixture.py
 ```
 
 SIFT1M (1M × 128-dim, published ground truth) for benchmarks; a 10,000-vector fixture with exact
