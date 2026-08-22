@@ -3,7 +3,7 @@
 **An HNSW vector index with Product-Quantization compression and hybrid dense+sparse retrieval,
 written from scratch in C++17 and benchmarked against FAISS.**
 
-> **Status: Phase 0 (rails). No measurements yet.**
+> **Status: Phase 1 complete — exact search verified. HNSW (Phase 2) not started.**
 > This README is deliberately empty of numbers. Every claim below the line will arrive with a JSON
 > record in [`results/`](results/) and the git SHA that produced it — see `CONTEXT.md` D10. If you
 > are reading this and a number has no record behind it, that is a bug in the README.
@@ -92,10 +92,33 @@ real regression once it reaches a plot.
 
 ## Benchmarks
 
-*Empty by design.* The table will carry recall@10, QPS at matched recall, p50/p95/p99, peak memory,
-and index build time, for VecCore and FAISS measured **in the same session on the same machine with
-matched thread counts, interleaved A/B/A/B**. Build time is expected to lose to FAISS, and that row
-will be reported rather than omitted.
+**Exact search only so far.** i5-11400H, single thread, Release `-O3 -march=native`, WSL2.
+Every row traces to a record in [`results/bench.jsonl`](results/bench.jsonl).
+
+| dataset | n | recall@10 | QPS | p50 | p99 | peak RSS |
+|---|---|---|---|---|---|---|
+| SIFT10K fixture | 10,000 | **1.0000** | 1298 ± 12 | 0.74 ms | 1.06 ms | 9.6 MiB |
+| SIFT1M (200 queries) | 1,000,000 | **0.9995** | 12.30 ± 0.04 | 80.2 ms | 94.4 ms | 492 MiB |
+
+The 0.9995 is not a shortfall — it is **one exact distance tie in 2000**. Query 93's published
+neighbour 274922 and our 196106 are both at d² = 42192.0; an independent numpy implementation makes
+the identical choice. `scripts/diagnose_recall.py` proves this rather than asserting it.
+
+**Memory layout (D5), 200k vectors, 98 MiB — past this CPU's 12 MB L3:**
+
+| access pattern | flat | naive `vector<vector<float>>` | flat advantage |
+|---|---|---|---|
+| sequential | 62.7 QPS | 54.8 QPS | 1.14× |
+| random | 25.3 QPS | 15.1 QPS | **1.67×** |
+
+Layout barely matters for a sequential scan; it matters under random access — which is what HNSW
+does, since graph traversal visits neighbours in an order no prefetcher can predict. The first
+version of this benchmark reported the naive layout as *faster*; see `BUGS.md` B-05 for why, which
+is the more interesting half.
+
+The FAISS head-to-head table arrives in Phase 6, measured **in the same session on the same machine
+with matched thread counts, interleaved A/B/A/B**. Build time is expected to lose to FAISS, and that
+row will be reported rather than omitted.
 
 ## Design decisions
 

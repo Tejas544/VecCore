@@ -254,8 +254,8 @@ on a 3½-day budget, debugging two layers at once is how days disappear.
 
 | Phase | Exit criterion |
 |---|---|
-| 0 | `cmake --build` produces a binary; ASan catches a deliberately planted bug; first commit pushed |
-| 1 | Brute-force top-10 on SIFT10K matches the published ground truth **exactly**; `bench` writes a valid JSON record |
+| 0 | ✅ **PASSED 2026-08-21.** `asan_probe` aborts with a heap-buffer-overflow report; 22 tests green; `bench` writes a trusted record |
+| 1 | ✅ **PASSED 2026-08-22.** Brute force = 1.0000 recall@10 vs the SIFT10K fixture (5 trials). On full SIFT1M vs the *published* ground truth: 0.9995, and every disagreement proven to be an exact distance tie (`scripts/diagnose_recall.py`), which is the real criterion — an exact id match is unachievable where the data ties. `bench` writes stamped JSON records |
 | 2 | HNSW **recall@10 ≥ 0.95** on SIFT10K at some `ef_search`, verified against Phase 1's ground truth |
 | 3 | PQ reconstruction error decreases monotonically as `m` grows; ADC recall@10 ≥ 0.80 at 16× compression |
 | 4 | BM25 reproduces a hand-computed score on a 3-document toy corpus to 6 decimal places |
