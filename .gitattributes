@@ -1,0 +1,20 @@
+# The source tree is edited on Windows and built/executed inside WSL2 (D2).
+# Without this, git's autocrlf turns scripts/fetch_sift.sh into a file whose
+# shebang ends in , and bash reports:
+#     /usr/bin/env: 'bash': No such file or directory
+# which names neither the file nor the real cause. Force LF everywhere; every
+# consumer of this repo is a Linux toolchain.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.cpp  text eol=lf
+*.hpp  text eol=lf
+*.in   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+
+# Datasets are binary and must never be line-ending translated.
+*.fvecs binary
+*.ivecs binary
+*.tar.gz binary
