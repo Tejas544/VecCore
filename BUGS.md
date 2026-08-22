@@ -159,6 +159,35 @@ D:\WSL\Ubuntu`. The distro belongs on `D:` regardless of the disk situation — 
 compiler stamps (D10). A benchmark run that fails or slows because the disk filled mid-sweep is
 otherwise indistinguishable from a code regression.
 
+### L-06 · Windows line endings would have broken the shell scripts inside WSL · 2026-08-21 · Phase 0
+
+**Found by:** git printing `warning: LF will be replaced by CRLF the next time Git touches it` on
+the first commit, and taking the warning seriously instead of scrolling past it.
+
+**The trap.** D2 puts the source tree on Windows and the toolchain inside WSL — which is the right
+call for every reason listed there, and it creates exactly one hazard: `core.autocrlf` is `true`
+globally on this machine, so a fresh `git clone` (or any `git checkout`) writes `scripts/fetch_sift.sh`
+with CRLF endings. Bash then reads the shebang as `#!/usr/bin/env bash\r` and reports:
+
+```
+/usr/bin/env: 'bash\r': No such file or directory
+```
+
+That message names neither the file nor the cause, and the file looks completely normal in every
+editor. It is a reliable twenty-minute detour.
+
+**Why it had not fired yet.** The working copy was written with LF, so everything ran locally. The
+failure would have appeared on the first `git clone` — most likely on Aug 25, on a fresh machine or
+after a reset, with no obvious connection to a commit made four days earlier.
+
+**Fix.** `.gitattributes` with `* text=auto eol=lf`, plus explicit `binary` for `*.fvecs`/`*.ivecs`
+so dataset files are never line-ending translated — that second half matters more than it looks,
+because CRLF translation of a binary vector file corrupts it silently and it would present as
+P-01, a completely unrelated diagnosis.
+
+**Generalised lesson:** a warning that names a future tense — *"will be replaced the next time"* —
+is describing a bug you have not hit yet. Those are the cheapest ones to fix.
+
 ---
 
 ## Predicted failure modes
