@@ -37,6 +37,8 @@ story is what the interview is actually about.
 | B-07 | k-means++ stuck in a local minimum; a random-data test hid it | silent recall loss | ~25 min |
 | B-08 | RRF made retrieval *worse* — a real negative result, with the oracle measured | *(not a bug)* | ~30 min |
 | B-09 | `git stash pop` failed on conflict and reported it as reassurance | untested code path | ~3 min |
+| B-10 | A `const` search method wrote to shared members; TSan-confirmed race | data race | ~20 min |
+| B-11 | **4 readers starve the writer entirely — inserts stop happening** | data race / starvation | ~45 min |
 
 **Phase 0 scorecard:** 7 landmines defused, 0 confirmed bugs, ~1.5 h. Four of the seven
 (L-01, L-02, L-05, L-06) were found by checking a tool *before* depending on it rather than after.
@@ -410,7 +412,152 @@ files changed.**
 
 ---
 
+### B-10 · A `const` search method that was never safe to call concurrently · 2026-08-22 · Phase 5
+
+**Found by:** designing the locking layer, before writing any threaded code. Phase 2's
+`HnswIndex::search` is `const`, takes no mutable arguments, and returns a value. It also writes to
+two members: `mutable VisitedList visited_` and `mutable std::size_t distance_calls_`.
+
+**Why that is a race and not a curiosity.** The plan (D8) is a `std::shared_mutex` with readers
+taking `shared_lock`. **Shared locks are held by many readers *simultaneously* — that is their
+entire purpose.** So the lock grants shared ownership of the index, and grants nothing whatsoever
+about writing to it. Two concurrent searches would have corrupted each other's visited stamps and
+raced on the counter, and the visited corruption would have produced *wrong results*, not a crash:
+a node incorrectly marked visited is silently skipped, and recall drops nondeterministically under
+load. That is the worst failure shape this project has.
+
+**The trap in one sentence: `const` describes the logical operation, not the absence of writes**,
+and `mutable` is precisely the keyword for "I am writing to this anyway." A reviewer scanning for
+races by looking for non-const methods would have missed it entirely.
+
+**Fix.** A caller-owned `SearchScratch { VisitedList visited; std::size_t distance_calls; }`, and
+`search(query, k, ef, SearchScratch&)` as the thread-safe overload. The single-argument overload
+remains for single-threaded callers with a docstring saying, in as many words, that it is not safe
+to call concurrently *even under a shared lock*.
+
+**The counter deserved separate thought, and this is the part worth telling.** The obvious fix was
+`std::atomic<std::size_t> distance_calls_`. It would have compiled, been race-free, and been a
+**performance bug**: the counter is incremented once per distance computation — thousands of times
+per query — so an atomic would have put a read-modify-write in the hottest loop in the project
+*and* placed every thread's increments on one cache line. That is textbook false sharing. It would
+have surfaced as "concurrency does not scale", and the lock would have taken the blame, which is
+P-30's exact failure mode. **Per-thread state has neither problem, and it is less code.**
+
+**Prevention:** `TEST_CASE("concurrent readers agree with the single-threaded answer")` runs the
+same 200 queries from 8 threads and asserts bit-identical results against the serial answer.
+
+**Confirmed by ThreadSanitizer, not just by argument.** `tools/tsan_probe.cpp` deliberately calls
+the unsafe overload from four threads, and TSan reports exactly the predicted race:
+
+```
+WARNING: ThreadSanitizer: data race
+  Read of size 2 by thread T2:
+    veccore::VisitedList::reset()   include/veccore/visited.hpp:44
+    veccore::HnswIndex::search_layer(...)  src/hnsw.cpp:66
+  Previous write of size 2 by thread T1:
+    veccore::VisitedList::reset()   include/veccore/visited.hpp:53
+```
+
+The epoch counter, read on one thread and written on another. That probe does double duty: it is
+also the proof that TSan is genuinely running on this build, which is L-01's lesson applied to a
+second sanitizer. A clean TSan run over the test suite means nothing unless TSan can be shown to
+fire.
+
+**Cost:** ~20 minutes, all of it design. Zero minutes debugging, because it never shipped.
+
+---
+
+### B-11 · Four readers starve the writer completely — the index stops accepting inserts · 2026-08-22 · Phase 5
+
+**Symptom.** The concurrent read+insert test ran for **ten minutes at 400% CPU** and never
+finished. Four reader threads, one writer inserting 2000 vectors.
+
+**Wrong theory:** that ASan was making it slow. Plausible — the same suite takes 70 s under ASan,
+inserts are the expensive path, and "sanitizers are slow" is true. It is also *lazy*, and it
+would have been fixed by lowering the insert count until the test passed, leaving the real
+behaviour in the shipped code.
+
+**Diagnosis.** Instead of tuning the test, I built a standalone probe in Release and swept reader
+count against a fixed 200 inserts:
+
+```
+readers=0   4.0 ms total   mean 0.02 ms   worst 0.05 ms
+readers=1  15.2 ms total   mean 0.08 ms   worst 0.31 ms
+readers=2 278.6 ms total   mean 1.39 ms   worst 7.83 ms
+readers=4  DID NOT COMPLETE in 30 s
+readers=8  DID NOT COMPLETE in 30 s
+```
+
+Not a slowdown. A **cliff**. 0.02 → 0.08 → 1.39 ms → unbounded.
+
+**Root cause.** `std::shared_mutex` on libstdc++ is a `pthread_rwlock_t`, and **glibc's default is
+reader-preferring**. A reader arriving while other readers hold the lock is admitted immediately,
+even with a writer already queued. Four threads searching in a tight loop means the reader count
+never reaches zero, so the writer's `unique_lock` never becomes grantable. This is documented
+glibc behaviour, and `std::shared_mutex` exposes no way to change it — there is no equivalent of
+`PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP` in the standard interface.
+
+**Why this is exactly the wrong default for this project.** A vector index is *the* canonical
+many-readers-occasional-writer workload. The standard library's default choice silently converts
+"inserts are slower under load" into "inserts never happen."
+
+**Fix — a turnstile, about ten lines.** A plain `std::mutex` that readers acquire and release
+immediately on the way in, and that a **writer holds across its whole wait-and-write**. New
+readers block at the turnstile instead of overtaking the writer at the rwlock; readers already
+inside drain; the writer is granted. Exposed as `LockMode::WriterPriority`, and it is now the
+default.
+
+**Measured, on a 200-insert workload with continuous readers:**
+
+| lock mode | readers | inserts completed | total | insert p50 | insert p99 |
+|---|---|---|---|---|---|
+| shared_mutex | 0 | 200/200 | 62 ms | 0.30 ms | 0.56 ms |
+| shared_mutex | 2 | 200/200 | 4,674 ms | 15.78 ms | 97.50 ms |
+| **shared_mutex** | **4** | **28/200** | **30,171 ms** | **520 ms** | **4,446 ms** |
+| writer_priority | 0 | 200/200 | 64 ms | 0.30 ms | 0.63 ms |
+| writer_priority | 2 | 200/200 | 70 ms | 0.34 ms | 0.61 ms |
+| **writer_priority** | **4** | **200/200** | **77 ms** | **0.37 ms** | **0.79 ms** |
+
+Writer p99 under 4 readers: **4,446 ms → 0.79 ms**, a 5,600× improvement, and the turnstile costs
+read throughput nothing measurable (see the scaling table — the three lock modes are within noise
+of each other at every thread count).
+
+**Prevention:** `TEST_CASE("writer priority bounds insert latency under continuous read load
+(B-11)")`, with a deliberately loose bound so it is not flaky; the quantified comparison lives in
+`bench`, where it belongs.
+
+**Cost:** ~45 minutes, ten of which were the hung test.
+
+**The lesson, and it is the one I would lead with.** A test that hangs is reporting a result. The
+cheap read was "ASan is slow, lower the loop count"; the test would then have passed while the
+shipped default silently could not accept a write under load. **When a test is slow, find out
+whether it is slow or stopped** — those are different findings, and only one of them is a bug in
+the code rather than the test.
+
+---
+
 ## Defused landmines
+
+### L-09 · ThreadSanitizer aborts at startup on this kernel unless ASLR is off · 2026-08-22 · Phase 5
+
+`tsan_probe` died before running a single line:
+
+```
+FATAL: ThreadSanitizer: unexpected memory mapping 0x79af41e72000-0x79af42300000
+```
+
+TSan maps shadow memory at fixed addresses, and recent kernels randomise `mmap` over a range wide
+enough to land inside them. The failure is **nondeterministic** -- the test binary had just run
+cleanly under TSan minutes earlier, which is the dangerous part: an intermittent startup abort in
+a CI script reads as a flaky test rather than a tooling constraint.
+
+**Fix:** run TSan binaries under `setarch -R`, which disables address-space randomisation for that
+process. Recorded in the README's build instructions rather than left as folklore.
+
+**Why it is a landmine and not a bug:** had the probe not existed, the clean TSan run over the
+test suite would have been taken as proof of race-freedom. It would have been -- that run really
+did initialise TSan. But the next run might not have, and nobody would have known which kind of
+"clean" they were looking at.
 
 Things that would have cost hours, caught before they did. **These count.** "I checked whether my
 tooling could actually catch memory bugs before I started writing code that would need it" is a

@@ -219,6 +219,99 @@ def pq_pareto(records: list[dict], out: Path) -> None:
     print(f"  wrote {path}")
 
 
+def thread_scaling(records: list[dict], out: Path) -> None:
+    """Read throughput vs thread count, per lock mode and per working-set size.
+
+    Two things this figure has to show, because P-30 warns that the obvious
+    explanation is usually wrong:
+      1. the three lock modes lie on top of each other -- the lock is NOT what
+         limits scaling, and `none` is the control that proves it;
+      2. the cache-resident and memory-resident curves diverge, which is what
+         does limit it.
+    """
+    rs = [r for r in records if r["index_params"].get("kind") == "thread_scaling"]
+    if not rs:
+        print("  no thread_scaling records; skipping")
+        return
+
+    by_n: dict[int, list[dict]] = {}
+    for r in rs:
+        by_n.setdefault(r["n_base"], []).append(r)
+
+    fig, axes = plt.subplots(1, len(by_n), figsize=(6.5 * len(by_n), 5), squeeze=False)
+    for ax, (n, group) in zip(axes[0], sorted(by_n.items())):
+        by_mode: dict[str, list[dict]] = {}
+        for r in group:
+            by_mode.setdefault(r["index_params"]["lock_mode"], []).append(r)
+
+        max_t = 1
+        for mode, items in sorted(by_mode.items()):
+            items.sort(key=lambda r: r["index_params"]["threads"])
+            xs = [r["index_params"]["threads"] for r in items]
+            ys = [r["measurements"]["speedup"] for r in items]
+            max_t = max(max_t, max(xs))
+            ax.plot(xs, ys, marker="o", label=mode)
+
+        ax.plot([1, max_t], [1, max_t], ls=":", color="grey", label="linear")
+        ax.axvline(6, ls="--", lw=1, color="firebrick", alpha=0.6)
+        ax.annotate("6 physical cores\n(12 are hyperthreads)", (6, 1.2),
+                    fontsize=8, color="firebrick", ha="center")
+        mib = n * 128 * 4 / (1024 * 1024)
+        cache = "fits in 12 MB L3" if mib < 12 else "exceeds 12 MB L3"
+        ax.set_title(f"n = {n:,}  ({mib:.0f} MiB, {cache})")
+        ax.set_xlabel("threads")
+        ax.set_ylabel("speedup vs 1 thread")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+
+    fig.suptitle("Read scaling, HNSW ef_search=64 -- the three lock modes coincide, "
+                 "so the lock is not the limiter (P-30)", y=1.0)
+    fig.tight_layout()
+    path = out / "thread_scaling.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {path}")
+
+
+def writer_starvation(records: list[dict], out: Path) -> None:
+    """Insert latency under continuous read load. B-11."""
+    rs = [r for r in records if r["index_params"].get("kind") == "writer_starvation"]
+    if not rs:
+        print("  no writer_starvation records; skipping")
+        return
+    n = max(r["n_base"] for r in rs)
+    rs = [r for r in rs if r["n_base"] == n]
+
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    by_mode: dict[str, list[dict]] = {}
+    for r in rs:
+        by_mode.setdefault(r["index_params"]["lock_mode"], []).append(r)
+
+    for mode, items in sorted(by_mode.items()):
+        items.sort(key=lambda r: r["index_params"]["readers"])
+        xs = [r["index_params"]["readers"] for r in items]
+        ys = [r["measurements"]["insert_p99_ms"] for r in items]
+        ax.plot(xs, ys, marker="o", label=mode)
+        for r, x, y in zip(items, xs, ys):
+            if r["measurements"].get("starved"):
+                ax.annotate(f"STARVED\n{r['measurements']['inserts_completed']}/200 inserts",
+                            (x, y), textcoords="offset points", xytext=(-70, -6),
+                            fontsize=8, color="firebrick", fontweight="bold")
+
+    ax.set_yscale("log")
+    ax.set_xlabel("concurrent reader threads")
+    ax.set_ylabel("insert p99 latency, ms (log scale)")
+    ax.set_title(f"Writer starvation, n = {n:,}\n"
+                 "glibc's shared_mutex is reader-preferring; a turnstile fixes it (B-11)")
+    ax.grid(alpha=0.3, which="both")
+    ax.legend()
+    fig.tight_layout()
+    path = out / "writer_starvation.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {path}")
+
+
 def latency_distribution(records: list[dict], out: Path) -> None:
     """p50 vs p99, because a mean hides the tail that matters in serving."""
     hnsw = [r for r in records if r["index"] == "hnsw" and r["measurements"].get("recall_at_k")]
@@ -250,7 +343,8 @@ def markdown_table(records: list[dict], out: Path) -> None:
     rows = []
     for r in records:
         m, p = r["measurements"], r["index_params"]
-        if p.get("kind") == "layout_ab":
+        if p.get("kind") in ("layout_ab", "thread_scaling", "writer_starvation",
+                             "edgerag_hybrid"):
             continue
         rows.append({
             "index": r["index"],
@@ -304,6 +398,8 @@ def main() -> int:
     recall_qps_curve(records, out)
     latency_distribution(records, out)
     pq_pareto(records, out)
+    thread_scaling(records, out)
+    writer_starvation(records, out)
     layout_ab(records, out)
     markdown_table(records, out)
     return 0

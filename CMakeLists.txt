@@ -136,6 +136,14 @@ if(VECCORE_ASAN)
   target_link_libraries(asan_probe PRIVATE veccore)
 endif()
 
+# Phase 5 gate: this must produce a ThreadSanitizer data-race report.
+# A clean TSan run over the test suite proves nothing unless TSan can be shown
+# to fire on this build -- L-01's lesson, applied to a second sanitizer.
+if(VECCORE_TSAN)
+  add_executable(tsan_probe tools/tsan_probe.cpp)
+  target_link_libraries(tsan_probe PRIVATE veccore)
+endif()
+
 # EdgeRAG hybrid evaluation (D7). Lives in tools/ because the TF-IDF baseline
 # it contains is a baseline, not a component -- same treatment as FAISS.
 add_executable(hybrid_eval tools/hybrid_eval.cpp)
