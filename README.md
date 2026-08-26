@@ -429,6 +429,16 @@ the end is a limitations section that flatters:
   it was in the limitations section, which is the worst place in the repo to guess — B-12.)*
 - Plus whatever `PLAN.md` §0.3's cut order takes, which will be listed here by name.
 
+## The CV bullet, with the blanks filled from `results/`
+
+> Implemented an HNSW vector index and Product-Quantization compression from scratch in **C++17**
+> with concurrent reads and Python bindings; achieved **recall@10 of 0.9755** at **1,934 QPS /
+> 0.83 ms p99** with **16–128× memory compression**, **within 1.7× of FAISS** on SIFT1M at matched
+> parameters. Added BM25 retrieval with RRF, replacing TF-IDF in a downstream RAG system for
+> **+4.17% recall@5 at 11× lower latency**.
+
+Every number above traces to a JSON record in [`results/bench.jsonl`](results/bench.jsonl).
+
 ## Reproducing
 
 Every plot regenerates from the JSONL records in `results/`. Every record carries the git SHA, CPU
