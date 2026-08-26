@@ -51,6 +51,26 @@ imaginary:
 ~/veccore-build-debug/bin/asan_probe
 ```
 
+**ThreadSanitizer** is a third, separate build (TSan and ASan cannot coexist):
+
+```bash
+cmake -S . -B ~/veccore-build-tsan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVECCORE_TSAN=ON && cmake --build ~/veccore-build-tsan
+```
+
+`setarch -R` is **not optional** — TSan maps shadow memory at fixed addresses and this kernel's
+ASLR range overlaps them, aborting at startup nondeterministically (`BUGS.md` L-09). The
+personality flag is inherited by children, so wrapping `ctest` covers every test:
+
+```bash
+setarch -R ctest --test-dir ~/veccore-build-tsan --output-on-failure
+```
+
+And the Phase 5 gate — this one must *report a race*, proving TSan is genuinely active:
+
+```bash
+setarch -R ~/veccore-build-tsan/bin/tsan_probe
+```
+
 Python side — Ubuntu 24.04 enforces PEP 668, so this needs a venv rather than a bare
 `pip install`:
 

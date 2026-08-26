@@ -551,13 +551,23 @@ enough to land inside them. The failure is **nondeterministic** -- the test bina
 cleanly under TSan minutes earlier, which is the dangerous part: an intermittent startup abort in
 a CI script reads as a flaky test rather than a tooling constraint.
 
-**Fix:** run TSan binaries under `setarch -R`, which disables address-space randomisation for that
-process. Recorded in the README's build instructions rather than left as folklore.
+**Fix:** run TSan binaries under `setarch -R`, which disables address-space randomisation for the
+process. The personality flag is **inherited by children**, so wrapping the whole test runner works
+and no build-system change is needed:
+
+```
+setarch -R ctest --test-dir ~/veccore-build-tsan
+```
+
+Confirmed: without it, 30+ of 75 tests fail with `FATAL: unexpected memory mapping` at startup;
+with it, **75/75 pass**. Recorded in the README's build instructions rather than left as folklore.
 
 **Why it is a landmine and not a bug:** had the probe not existed, the clean TSan run over the
-test suite would have been taken as proof of race-freedom. It would have been -- that run really
-did initialise TSan. But the next run might not have, and nobody would have known which kind of
-"clean" they were looking at.
+concurrency tests would have been taken as proof of race-freedom. It would have been -- that run
+really did initialise TSan. But the very next full-suite run had 30+ startup aborts, and a CI log
+full of `FATAL` lines is easy to read as "the concurrency work broke something" rather than "the
+sanitizer could not start". **Two failure modes that look nothing alike in the code and identical
+in a test report.**
 
 Things that would have cost hours, caught before they did. **These count.** "I checked whether my
 tooling could actually catch memory bugs before I started writing code that would need it" is a
