@@ -106,7 +106,7 @@ Args parse(int argc, char** argv) {
             return argv[++i];
         };
         if      (arg == "--tag")             a.tag = next("a value");
-        else if (arg == "--index")           a.index = next("flat|hnsw");
+        else if (arg == "--index")           a.index = next("flat|hnsw|pq");
         else if (arg == "--out")             a.out = next("a path");
         else if (arg == "--base")            a.base = next("a path");
         else if (arg == "--query")           a.query = next("a path");
@@ -216,8 +216,8 @@ int main(int argc, char** argv) {
         usage();
         return args.help ? 0 : 2;
     }
-    if (args.index != "flat" && args.index != "hnsw") {
-        std::cerr << "bench: --index must be flat or hnsw\n";
+    if (args.index != "flat" && args.index != "hnsw" && args.index != "pq") {
+        std::cerr << "bench: --index must be flat, hnsw or pq\n";
         return 2;
     }
 

@@ -152,6 +152,73 @@ def layout_ab(records: list[dict], out: Path) -> None:
     print(f"  wrote {path}")
 
 
+def pq_pareto(records: list[dict], out: Path) -> None:
+    """Recall vs memory vs latency for PQ.
+
+    A compression ratio quoted without the recall it lands at is exactly the
+    overclaiming WHAT_IS_THIS.md section 10 criticises other people for, so the
+    three axes stay together in one figure.
+    """
+    pq = [r for r in records
+          if r["index_params"].get("kind") == "pq" and r["measurements"].get("recall_at_k")]
+    if not pq:
+        print("  no pq records; skipping Pareto plot")
+        return
+
+    flat = [r for r in records if r["index"] == "flat" and r["measurements"].get("recall_at_k")]
+    n = max(r["n_base"] for r in pq)
+    pq = [r for r in pq if r["n_base"] == n]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+
+    by_rerank: dict[int, list[dict]] = {}
+    for r in pq:
+        by_rerank.setdefault(r["index_params"]["rerank"], []).append(r)
+
+    for rr, rs in sorted(by_rerank.items()):
+        rs.sort(key=lambda r: r["measurements"]["bytes_per_vector"])
+        xs = [r["measurements"]["bytes_per_vector"] for r in rs]
+        ys = [r["measurements"]["recall_at_k"] for r in rs]
+        label = "ADC only" if rr == 0 else f"ADC + exact rerank top-{rr}"
+        ax1.plot(xs, ys, marker="o", label=label)
+        for r, x, y in zip(rs, xs, ys):
+            ax1.annotate(f"m={r['index_params']['m']}\n{r['measurements']['compression_ratio']:.0f}x",
+                         (x, y), textcoords="offset points", xytext=(6, -10), fontsize=7, alpha=0.8)
+
+        ax2.plot([r["measurements"]["qps_mean"] for r in rs], ys, marker="o", label=label)
+
+    raw = next((r["measurements"]["bytes_per_vector"] for rs in by_rerank.values() for r in rs), 0)
+    ax1.axhline(1.0, ls="--", lw=1, color="grey", alpha=0.7)
+    ax1.annotate("exact search (512 B/vector)", (0.98, 1.0), xycoords=("axes fraction", "data"),
+                 ha="right", va="bottom", fontsize=8, color="grey")
+    ax1.set_xscale("log", base=2)
+    ax1.set_xlabel("bytes per vector (log scale)")
+    ax1.set_ylabel(f"recall@10, n={n:,}")
+    ax1.set_title("PQ: what the compression costs in recall")
+    ax1.grid(alpha=0.3, which="both")
+    ax1.legend(fontsize=8)
+
+    for r in flat:
+        if r["n_base"] == n:
+            ax2.axvline(r["measurements"]["qps_mean"], ls="--", lw=1, color="grey", alpha=0.7)
+            ax2.annotate(f"brute force ({r['measurements']['qps_mean']:.0f} QPS)",
+                         (r["measurements"]["qps_mean"], 0.02), xycoords=("data", "axes fraction"),
+                         rotation=90, fontsize=8, color="grey", va="bottom")
+    ax2.set_xscale("log")
+    ax2.set_xlabel("queries/sec (log scale)")
+    ax2.set_ylabel("recall@10")
+    ax2.set_title("PQ: recall vs throughput")
+    ax2.grid(alpha=0.3, which="both")
+    ax2.legend(fontsize=8)
+
+    fig.suptitle(f"Product Quantization Pareto, SIFT1M ({raw and ''}single thread)", y=1.0)
+    fig.tight_layout()
+    path = out / "pq_pareto.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {path}")
+
+
 def latency_distribution(records: list[dict], out: Path) -> None:
     """p50 vs p99, because a mean hides the tail that matters in serving."""
     hnsw = [r for r in records if r["index"] == "hnsw" and r["measurements"].get("recall_at_k")]
