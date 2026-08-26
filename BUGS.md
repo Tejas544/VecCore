@@ -34,6 +34,9 @@ story is what the interview is actually about.
 | B-04 | Reported `recall@10 0.253` from a truncated base vs full ground truth | measurement that measured nothing | ~2 min |
 | B-05 | Layout A/B showed the *naive* layout faster; it never reproduced the pathology | measurement that measured nothing | ~25 min |
 | B-06 | One Phase 0 record broke every plot; append-only file outlived its schema | untested code path | ~10 min |
+| B-07 | k-means++ stuck in a local minimum; a random-data test hid it | silent recall loss | ~25 min |
+| B-08 | RRF made retrieval *worse* — a real negative result, with the oracle measured | *(not a bug)* | ~30 min |
+| B-09 | `git stash pop` failed on conflict and reported it as reassurance | untested code path | ~3 min |
 
 **Phase 0 scorecard:** 7 landmines defused, 0 confirmed bugs, ~1.5 h. Four of the seven
 (L-01, L-02, L-05, L-06) were found by checking a tool *before* depending on it rather than after.
@@ -308,6 +311,102 @@ your code, not a verdict on your threshold.* The cheap move — relax the assert
 would have left a genuine robustness hole in the component whose failures are hardest to attribute.
 Four seeds and a printout separated "my test is wrong" from "my code is fragile", and it turned out
 to be both.
+
+---
+
+### B-08 · RRF made retrieval *worse*, and the interesting part is why · 2026-08-22 · Phase 4
+
+**Not a code bug** — every RRF unit test passes, including hand-computed arithmetic and the
+scale-invariance property. This is a **measured negative result**, and it is logged here because
+`PLAN.md` §4.5 pre-committed to it: *"If hybrid does not beat both, say so **and investigate** — on
+some datasets it does not, and reporting a null result honestly is a stronger signal than a lift
+you cannot explain."*
+
+**Symptom.** On EdgeRAG's 362-document corpus with 650 real queries:
+
+| retriever | recall@5 |
+|---|---|
+| TF-IDF (EdgeRAG today) | 0.1846 |
+| **BM25** | **0.1923** |
+| RRF(BM25, TF-IDF) | 0.1862 |
+
+Fusion landed *between* the two inputs, below the better one.
+
+**The tempting non-explanation** was "the two retrievers agree, so there's nothing to fuse." That
+sounds right, is cheap to write, and is **wrong** — which the measurement shows.
+
+**What was actually measured**, per query, over all 650:
+
+```
+mean top-10 overlap between BM25 and TF-IDF : 0.4915
+both find the gold document @5              : 112
+BM25 finds it, TF-IDF does not              :  13
+TF-IDF finds it, BM25 does not              :   8
+neither                                     : 517
+
+oracle fusion recall@5 (always pick the right one) : 0.2046
+BM25 alone                                         : 0.1923
+RRF                                                : 0.1862
+```
+
+**So complementary signal exists.** TF-IDF uniquely finds the gold document for 8 queries BM25
+misses. A perfect fuser would reach **0.2046** — a real **+6.4%** over BM25 alone. RRF captures
+none of it and goes backwards by 3.2%.
+
+**Root cause, precisely.** RRF fuses by **rank alone**, which is exactly what makes it tuning-free
+and scale-free — and it is the same property that makes it fail here. It has no mechanism to know
+that one input list is better than the other; it treats every retriever as equally authoritative.
+That is the right bet when retrievers are **complementary** (each authoritative on different
+queries) and the wrong one when they are **correlated with one dominating** (49% overlap, 13 vs 8
+on unique finds). Averaging a stronger ranker with a weaker one that mostly agrees can only pull it
+toward the weaker.
+
+**The answer this buys, which is worth more than a lift would have been.** "Why RRF over weighted
+score fusion?" is a standard question, and the standard answer — *incomparable scales, no
+normalisation needed* — is only half of it. The other half is the cost: **RRF's scale-blindness is
+also authority-blindness.** When you have good reason to believe one retriever dominates, RRF is
+the wrong tool, and the measurement above is how you would know. Weighted fusion *could* have
+exploited that headroom — at the price of a weight fitted to this corpus that would be wrong on
+the next one.
+
+**Not fixed, and deliberately so.** The fix would be to weight the lists, which abandons the
+property RRF exists for. Reported with the oracle number attached so the size of what is being
+left on the table is explicit.
+
+**The honest scope note.** EdgeRAG's dense signal was measured to be noise (`DEFAULT_ALPHA = 0.0`,
+hybrid == text_only bit-for-bit), so the only available second retriever on this corpus is another
+lexical one over the same tokens. **A genuine dense+sparse hybrid — where the two really are
+complementary — could not be measured here**, and needs a real text embedding model. Named as a
+limitation rather than substituted with a flattering number.
+
+---
+
+### B-09 · `git stash pop` failed silently and I nearly built on the wrong source · 2026-08-22 · Phase 4
+
+**Symptom:** after stashing to get a clean tree, running a binary, and popping, the source file was
+back to its pre-edit state. `grep -c mean_overlap tools/hybrid_eval.cpp` returned **0** for changes
+that had definitely been written.
+
+**Root cause:** the stash contained edits to *two* files — the source **and** `results/bench.jsonl`.
+The benchmark run appended to `results/bench.jsonl` in between, so `git stash pop` hit a conflict,
+refused to apply **anything**, and printed only `The stash entry is kept in case you need it
+again.` — a sentence that reads like reassurance and is actually a failure report.
+
+**Fix:** `git checkout -- results/bench.jsonl` then `git stash pop`.
+
+**The real fix, which is not a command.** The stash existed only to satisfy `bench`'s clean-tree
+trust check for one run. That was the wrong move: **`--allow-untrusted` exists precisely for this,
+and it stamps `trusted: false` so the record cannot be mistaken for publishable.** Reaching for
+`git stash` to trick a safety check into passing is working *against* the guard rather than with
+it. Commit, or pass the flag.
+
+**Cost:** ~3 minutes, and it could have been far worse — a rebuild on the reverted source would
+have produced a binary silently missing the diagnostic, with no error anywhere.
+
+**Third instance of the same family this project has hit** (L-07, B-02, now this): a tool that
+fails and reports it in a form that does not look like failure. Worth stating as a habit rather
+than three coincidences — **after any operation that is supposed to change files, verify the
+files changed.**
 
 ---
 
