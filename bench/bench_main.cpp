@@ -18,6 +18,7 @@
 #include "veccore/hnsw.hpp"
 #include "veccore/json.hpp"
 #include "veccore/metrics.hpp"
+#include "veccore/pq.hpp"
 #include "veccore/stamp.hpp"
 #include "veccore/storage.hpp"
 #include "veccore/xvecs.hpp"
@@ -40,7 +41,7 @@ namespace {
 
 struct Args {
     std::string tag = "flat";
-    std::string index = "flat";          // flat | hnsw
+    std::string index = "flat";          // flat | hnsw | pq
     std::string out = "results/bench.jsonl";
     std::string base, query, truth;
     std::size_t k = 10;
@@ -52,6 +53,11 @@ struct Args {
     std::size_t ef_construction = 200;
     std::vector<std::size_t> ef_search{10, 20, 40, 80, 160, 320};
     std::uint64_t seed = 42;
+    std::vector<std::size_t> pq_m{4, 8, 16, 32};
+    std::size_t pq_train = 100000;
+    std::size_t pq_iters = 25;
+    std::size_t pq_n_init = 3;
+    std::vector<std::size_t> pq_rerank{0, 100};
     bool layout_ab = false;
     bool allow_untrusted = false;
     bool help = false;
@@ -60,7 +66,7 @@ struct Args {
 void usage() {
     std::cout <<
         "usage: bench --base F.fvecs --query F.fvecs [--truth F.ivecs] [options]\n"
-        "  --index flat|hnsw   which index (default: flat)\n"
+        "  --index flat|hnsw|pq  which index (default: flat)\n"
         "  --tag NAME          label for the record\n"
         "  --out PATH          JSONL to append to\n"
         "  --k N               neighbours to retrieve (default: 10)\n"
@@ -72,6 +78,11 @@ void usage() {
         "  --ef-construction N HNSW build beam width (default: 200)\n"
         "  --ef-search A,B,C   HNSW query beam widths to sweep (default: 10,20,40,80,160,320)\n"
         "  --seed N            RNG seed; stamped into every record (default: 42)\n"
+        "  --pq-m A,B,C        PQ subspace counts to sweep (default: 4,8,16,32)\n"
+        "  --pq-train N        vectors used to train codebooks (default: 100000)\n"
+        "  --pq-iters N        k-means iterations (default: 25)\n"
+        "  --pq-n-init N       k-means restarts, lowest inertia kept (default: 3)\n"
+        "  --pq-rerank A,B     exact-rescore shortlist sizes; 0 = ADC only (default: 0,100)\n"
         "  --layout-ab         also run the D5 flat-vs-pointer-chasing comparison\n"
         "  --allow-untrusted   write a record from a Debug/sanitized/dirty build\n";
 }
@@ -109,6 +120,11 @@ Args parse(int argc, char** argv) {
         else if (arg == "--ef-construction") a.ef_construction = std::stoul(next("a number"));
         else if (arg == "--ef-search")       a.ef_search = parse_list(next("a list"));
         else if (arg == "--seed")            a.seed = std::stoull(next("a number"));
+        else if (arg == "--pq-m")            a.pq_m = parse_list(next("a list"));
+        else if (arg == "--pq-train")        a.pq_train = std::stoul(next("a number"));
+        else if (arg == "--pq-iters")        a.pq_iters = std::stoul(next("a number"));
+        else if (arg == "--pq-n-init")       a.pq_n_init = std::stoul(next("a number"));
+        else if (arg == "--pq-rerank")       a.pq_rerank = parse_list(next("a list"));
         else if (arg == "--layout-ab")       a.layout_ab = true;
         else if (arg == "--allow-untrusted") a.allow_untrusted = true;
         else if (arg == "-h" || arg == "--help") a.help = true;
@@ -368,6 +384,94 @@ int main(int argc, char** argv) {
             write_record(m, p);
         }
         std::cout << "\n  peak RSS   : " << peak_rss_mib() << " MiB\n";
+    }
+
+    // ---- product quantization ---------------------------------------------
+    if (args.index == "pq") {
+        const double raw_bytes_per_vec = static_cast<double>(base.dim()) * sizeof(float);
+        std::cout << "  raw       : " << raw_bytes_per_vec << " B/vector\n\n";
+
+        for (const std::size_t m : args.pq_m) {
+            if (base.dim() % m != 0) {
+                std::cout << "  m=" << m << " skipped: does not divide d=" << base.dim()
+                          << " (P-21)\n";
+                continue;
+            }
+
+            PqParams pp;
+            pp.m = m;
+            pp.train_size = args.pq_train;
+            pp.kmeans_iters = args.pq_iters;
+            pp.kmeans_n_init = args.pq_n_init;
+            pp.seed = args.seed;
+
+            ProductQuantizer pq(base.dim(), pp);
+            const auto t_train = Clock::now();
+            pq.train(base);
+            const double train_ms = ms_since(t_train);
+            const auto t_encode = Clock::now();
+            pq.encode(base);
+            const double encode_ms = ms_since(t_encode);
+
+            // P-24: measured from the real buffer, never from arithmetic on
+            // paper. Storing codes as int would be a 4x regression while the
+            // formula still claimed the same compression.
+            const double bytes_per_vec =
+                static_cast<double>(pq.code_bytes()) / static_cast<double>(base.size());
+            const double compression = raw_bytes_per_vec / bytes_per_vec;
+            const double mse = pq.reconstruction_mse(base, 10000);
+
+            std::cout << std::fixed << std::setprecision(4)
+                      << "  m=" << m << "  " << bytes_per_vec << " B/vector  "
+                      << compression << "x compression   recon MSE " << mse
+                      << "   train " << train_ms / 1000.0 << " s"
+                      << "  encode " << encode_ms / 1000.0 << " s"
+                      << "  reseeds " << pq.empty_cluster_reseeds() << "\n";
+
+            for (const std::size_t rr : args.pq_rerank) {
+                const RunResult r = measure(
+                    [&](const float* q) {
+                        return rr ? pq.search_rerank(q, args.k, rr, base) : pq.search(q, args.k);
+                    },
+                    queries, truth, args.k, args.trials, args.warmup, has_truth);
+
+                print_run(rr ? "    +rerank " + std::to_string(rr) : "    ADC only", r, args.k);
+
+                json::Object p;
+                p.str("kind", "pq")
+                 .num("m", static_cast<long long>(m))
+                 .num("centroids", static_cast<long long>(PqParams::kCentroids))
+                 .num("rerank", static_cast<long long>(rr))
+                 .num("train_size", static_cast<long long>(pp.train_size))
+                 .num("kmeans_iters", static_cast<long long>(pp.kmeans_iters))
+                 .num("kmeans_n_init", static_cast<long long>(args.pq_n_init))
+                 .num("seed", static_cast<long long>(pp.seed))
+                 .num("empty_cluster_reseeds", static_cast<long long>(pq.empty_cluster_reseeds()))
+                 .num("bytes_per_vector", bytes_per_vec)
+                 .num("compression_ratio", compression)
+                 .num("reconstruction_mse", mse)
+                 .num("train_ms", train_ms)
+                 .num("encode_ms", encode_ms);
+
+                json::Object mm = run_json(r);
+                // Rerank needs the full vectors resident, so its honest memory
+                // figure includes them. ADC-only does not -- that is the entire
+                // point of PQ, and conflating the two would overstate the
+                // compression the search actually runs on.
+                const offset_t footprint = pq.code_bytes() + pq.codebook_bytes() +
+                                           (rr ? base.bytes() : 0);
+                mm.num("index_bytes", static_cast<long long>(footprint))
+                  .num("code_bytes", static_cast<long long>(pq.code_bytes()))
+                  .num("codebook_bytes", static_cast<long long>(pq.codebook_bytes()))
+                  .num("compression_ratio", compression)
+                  .num("bytes_per_vector", bytes_per_vec)
+                  .num("reconstruction_mse", mse)
+                  .num("train_ms", train_ms);
+                write_record(mm, p);
+            }
+            std::cout << "\n";
+        }
+        std::cout << "  peak RSS   : " << peak_rss_mib() << " MiB\n";
     }
 
     // ---- optional D5 layout A/B -------------------------------------------

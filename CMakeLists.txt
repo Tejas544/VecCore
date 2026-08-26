@@ -114,7 +114,9 @@ configure_file(
 add_library(veccore STATIC
   src/stamp.cpp
   src/xvecs.cpp
-  src/hnsw.cpp)
+  src/hnsw.cpp
+  src/kmeans.cpp
+  src/pq.cpp)
 
 target_include_directories(veccore PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
