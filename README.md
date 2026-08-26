@@ -3,8 +3,8 @@
 **An HNSW vector index with Product-Quantization compression and hybrid dense+sparse retrieval,
 written from scratch in C++17 and benchmarked against FAISS.**
 
-> **Status: Phase 4 complete — HNSW, Product Quantization and BM25 all verified; HNSW and PQ
-> benchmarked head-to-head against FAISS.** Next: concurrency and thread scaling.
+> **Status: Phase 5 complete — HNSW, PQ, BM25 and concurrent search all verified; HNSW and PQ
+> benchmarked head-to-head against FAISS.** Next: Python bindings and the EdgeRAG integration.
 > This README is deliberately empty of numbers. Every claim below the line will arrive with a JSON
 > record in [`results/`](results/) and the git SHA that produced it — see `CONTEXT.md` D10. If you
 > are reading this and a number has no record behind it, that is a bug in the README.
@@ -209,6 +209,66 @@ be noise (`DEFAULT_ALPHA = 0.0`), so the only second retriever available is anot
 over the same tokens. That is a limitation of the data, named rather than substituted with a
 number that flatters.
 
+### Concurrency — read scaling, and a lock that stopped accepting writes
+
+![thread scaling](docs/plots/thread_scaling.png)
+
+Read-only throughput, HNSW `ef_search=64`, 3 trials, each thread taking a **disjoint** slice of the
+query set (P-28 — all threads issuing the same query would measure cache behaviour, not
+concurrency):
+
+| threads | n=10K (4.9 MiB, fits in 12 MB L3) | n=200K (98 MiB, exceeds L3) |
+|---|---|---|
+| 1 | 10,347 QPS (1.00×) | 3,651 QPS (1.00×) |
+| 2 | 20,701 (2.00×, 100%) | 6,341 (1.74×, 87%) |
+| 4 | 34,829 (**3.37×**, 84%) | 10,357 (**2.84×**, 71%) |
+| 6 | 42,129 (4.07×, 68%) | 12,267 (3.36×, 56%) |
+| 8 | 51,332 (4.96×, 62%) | 14,195 (3.89×, 49%) |
+| 12 | 57,825 (5.59×, 47%) | 15,172 (4.16×, 35%) |
+
+**The lock is not what limits scaling, and there is a control that proves it.** Running the same
+sweep with the lock *entirely removed* gives 14,994 QPS at 200K/12 threads against 15,172 with
+`shared_mutex` — a ~3% spread, inside trial noise. `BUGS.md` P-30 pre-registered the trap:
+*"it stops scaling because of lock contention"* is the plausible sentence, and it is **wrong here**.
+
+What does limit it, isolated by changing only the working-set size: the out-of-cache curve loses
+**~12 points of efficiency at every thread count**, which is memory bandwidth. Past 6 threads both
+curves flatten, because threads 7–12 are hyperthreads sharing execution units with a loop that
+already saturates them — 8→12 threads buys 3.89→4.16×. Turbo clock reduction as more cores
+engage is a third contributor and is not separated out; saying so beats attributing the residual to
+whichever cause sounds best.
+
+### The bug worth reading: 4 readers stop the index accepting writes
+
+![writer starvation](docs/plots/writer_starvation.png)
+
+`std::shared_mutex` on libstdc++ is a `pthread_rwlock_t`, and **glibc's default is
+reader-preferring**. Under continuous search load the reader count never reaches zero, so a writer's
+`unique_lock` never becomes grantable. Measured, 200 inserts at n=200K:
+
+| lock mode | readers | inserts completed | insert p50 | insert p99 |
+|---|---|---|---|---|
+| `shared_mutex` | 0 | 200/200 | 0.70 ms | 1.32 ms |
+| `shared_mutex` | 2 | 200/200 | 28.40 ms | 237 ms |
+| **`shared_mutex`** | **4** | **5/200 in 36 s** | **8,242 ms** | **11,902 ms** |
+| `writer_priority` | 0 | 200/200 | 0.70 ms | 1.31 ms |
+| `writer_priority` | 2 | 200/200 | 0.75 ms | 1.32 ms |
+| **`writer_priority`** | **4** | **200/200 in 159 ms** | **0.76 ms** | **1.54 ms** |
+
+Not a slowdown — a cliff. The fix is a ~10-line turnstile: a plain mutex that readers touch briefly
+on the way in and that a **writer holds across its whole wait**, so new readers queue behind it
+instead of overtaking it. Insert p99 under 4 readers goes **11,902 ms → 1.54 ms**, and the read
+scaling table above shows it costs read throughput nothing measurable. It is now the default.
+Full write-up in [`BUGS.md`](BUGS.md) B-11.
+
+A vector index is *the* canonical many-readers-occasional-writer workload, which makes this the
+wrong standard-library default for exactly this use case — and `std::shared_mutex` exposes no way
+to change it.
+
+**Verified with ThreadSanitizer**, and TSan itself is verified: `tools/tsan_probe.cpp` deliberately
+calls the non-thread-safe overload from 4 threads and TSan reports the expected race on the epoch
+counter. A clean sanitizer run proves nothing unless the sanitizer can be shown to fire (B-10, L-01).
+
 **Memory layout (D5)** — 200,000 vectors, 98 MiB, past this CPU's 12 MB L3:
 
 ![layout](docs/plots/layout_ab.png)
@@ -249,6 +309,13 @@ the end is a limitations section that flatters:
   sample size rather than left implicit.
 - **Approximate with no bound.** Recall is measured on a test set. Nothing guarantees it holds on
   data that drifts.
+- **Concurrent *insert* is coarse-grained.** One lock for the whole index, so inserts serialise
+  against each other and against all readers. The finer design — per-node link locks plus an atomic
+  entry point — is described in `concurrent.hpp` with its specific hazard, and was not built: a
+  subtle race in a graph mutation path produces a corrupted index that still returns k results, and
+  no assertion in this repo would catch it.
+- **Read scaling tops out around 4.2× on 6 cores** at a memory-resident working set. Memory
+  bandwidth, not the lock — measured, see above.
 - **The spec's "+3–10% hybrid recall lift" target is not achievable on the available data.**
   It needs a dense retriever that is complementary to the sparse one; EdgeRAG's dense signal is
   measured noise. BM25-over-TF-IDF (+4.17%) is what this corpus can actually demonstrate.
