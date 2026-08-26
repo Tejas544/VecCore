@@ -3,8 +3,8 @@
 **An HNSW vector index with Product-Quantization compression and hybrid dense+sparse retrieval,
 written from scratch in C++17 and benchmarked against FAISS.**
 
-> **Status: Phase 2 complete — HNSW verified against ground truth on SIFT1M.**
-> Next: Product Quantization (Phase 3).
+> **Status: Phase 3 complete — HNSW and Product Quantization both verified against ground truth
+> on SIFT1M, and both benchmarked head-to-head against FAISS.** Next: hybrid BM25+RRF retrieval.
 > This README is deliberately empty of numbers. Every claim below the line will arrive with a JSON
 > record in [`results/`](results/) and the git SHA that produced it — see `CONTEXT.md` D10. If you
 > are reading this and a number has no record behind it, that is a bug in the README.
@@ -129,6 +129,42 @@ The level histogram is not decoration. `mL = 1/ln(M)` is easy to get wrong (`1/M
 both plausible), nothing errors when you do, and the only symptom is a badly shaped hierarchy. The
 ratios matching 1/M to three decimal places is the evidence that it is right.
 
+### Product Quantization — compression, and what it costs
+
+![PQ Pareto](docs/plots/pq_pareto.png)
+
+| m | B/vector | compression | ADC recall@10 | **+ exact rerank top-100** | ADC QPS |
+|---|---|---|---|---|---|
+| 4 | 4 | 128× | 0.1071 | 0.4202 | 261 |
+| 8 | 8 | 64× | 0.3125 | 0.7779 | 164 |
+| 16 | 16 | 32× | 0.5344 | **0.9656** | 114 |
+| 32 | 32 | 16× | 0.7186 | **0.9987** | 55 |
+
+Reconstruction MSE falls monotonically with `m` — 39924 → 24165 → 10847 → 3665 — which is the
+check that the subspace slicing is right.
+
+**Against FAISS `IndexPQ`, same data, same `m`, both pinned to one thread:**
+
+| m | VecCore recall@10 | FAISS recall@10 | VecCore QPS | FAISS QPS | codebook train |
+|---|---|---|---|---|---|
+| 8 | **0.3125** | 0.3101 | 164 | 191 (1.17×) | 86.5 s vs **1.7 s** |
+| 32 | **0.7186** | 0.7059 | 55 | 62 (1.12×) | 114.2 s vs **3.7 s** |
+
+Recall marginally ahead of the reference implementation, throughput at 0.85–0.89× of it, and
+codebook training **50× slower** — see limitations, that gap is real and has a known cause.
+
+**PQ is a memory result, not a speed result**, and that distinction is the point. It gives 16–128×
+compression but only 4–20× speed over brute force — nothing like HNSW's 150×. That is not a
+shortfall, it is what PQ *is*: it still scans all one million codes, it just makes each comparison
+cheaper (4–32 bytes read instead of 512). **HNSW wins by not looking at most of the data; PQ wins by
+making all of the data small.**
+
+One honesty item, enforced in the harness rather than trusted to prose: **reranking needs the full
+vectors resident**, so a reranking configuration's real footprint includes all 488 MB. `bench`
+records code bytes, codebook bytes and total footprint as separate fields and never conflates them.
+Quoting 64× compression for a configuration that keeps the uncompressed vectors in RAM would be
+exactly the overclaiming `WHAT_IS_THIS.md` §10 criticises.
+
 **Memory layout (D5)** — 200,000 vectors, 98 MiB, past this CPU's 12 MB L3:
 
 ![layout](docs/plots/layout_ab.png)
@@ -169,6 +205,11 @@ the end is a limitations section that flatters:
   sample size rather than left implicit.
 - **Approximate with no bound.** Recall is measured on a test set. Nothing guarantees it holds on
   data that drifts.
+- **PQ codebook training is 50× slower than FAISS** (86.5 s vs 1.7 s at m=8). The cause is known
+  and specific: our k-means assignment step is a triple loop over (points × centroids × dims),
+  while FAISS expresses the same step as a matrix multiply and hands it to BLAS. Writing a blocked
+  GEMM was out of scope for the time available (`PLAN.md` §0.3); `n_init=3` restarts also triple
+  the cost by design (B-07). Reported, not excused.
 - **Build time is bad: 1,139 s for SIFT1M, single-threaded.** FAISS does this in a small number of
   minutes. Three known reasons, none of them mysterious: insertion is single-threaded; the backward
   link shrink recomputes a neighbour's whole distance list every time it overflows, where hnswlib
