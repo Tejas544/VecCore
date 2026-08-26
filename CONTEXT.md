@@ -326,6 +326,37 @@ the CPU *is* the device.
 
 ---
 
+## D12 · PQ is a memory result, not a speed result · **ACCEPTED** · 2026-08-22
+
+**Measured on SIFT1M**, 1000 held-out queries, single thread:
+
+| m | B/vector | compression | ADC recall@10 | +rerank top-100 | ADC QPS |
+|---|---|---|---|---|---|
+| 4 | 4 | 128× | 0.1071 | 0.4202 | 261 |
+| 8 | 8 | 64× | 0.3125 | 0.7779 | 164 |
+| 16 | 16 | 32× | 0.5344 | 0.9656 | 114 |
+| 32 | 32 | 16× | 0.7186 | 0.9987 | 55 |
+
+**The framing that matters, and it is not the obvious one.** PQ gives 16–128× *memory* compression
+and only 4–20× *speed* over brute force — nothing like HNSW's 150×. That is not a shortfall, it is
+what PQ is: it still scans every one of the million codes, it just makes each comparison cheaper
+(4–32 bytes read instead of 512). **The win is bytes, not hops.** HNSW wins by not looking at most
+of the data; PQ wins by making all of the data small. Saying that clearly is the difference between
+understanding the technique and having implemented it.
+
+**The honest memory number.** ADC-only at m=8 is ~8 MB of codes plus 128 KB of codebooks against
+488 MB raw. But **rerank needs the full vectors resident**, so a reranking configuration's real
+footprint includes all 488 MB. `bench` records those separately and never conflates them — quoting
+64× compression for a configuration that keeps the uncompressed vectors in RAM would be exactly
+the overclaiming `WHAT_IS_THIS.md` §10 criticises.
+
+**Rejected: making the Phase 3 gate pass by loosening it.** ADC-only at 16× measured 0.7186 against
+a written target of 0.80. Rather than adjust the number, FAISS `IndexPQ` was run on the same data
+at the same `m`: **0.7059**. We are 1.8% ahead of the reference implementation. The target was an
+estimate made before measuring; the code was never wrong. See `PLAN.md` §4.
+
+---
+
 ## D11 · No hand-written SIMD unless it is measured to matter · **PROPOSED** · 2026-08-21
 
 **Decision.** Compile `-O3 -march=native`, verify with `-fopt-info-vec-optimized` that the distance

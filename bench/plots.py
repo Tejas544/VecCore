@@ -303,6 +303,7 @@ def main() -> int:
 
     recall_qps_curve(records, out)
     latency_distribution(records, out)
+    pq_pareto(records, out)
     layout_ab(records, out)
     markdown_table(records, out)
     return 0
