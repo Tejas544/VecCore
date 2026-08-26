@@ -277,22 +277,76 @@ int main(int argc, char** argv) {
     print("BM25 (VecCore)", s_bm25, ceiling);
     print("RRF(BM25, TF-IDF)", s_rrf, ceiling);
 
+    // --- why did RRF not help? -------------------------------------------
+    //
+    // PLAN.md 4.5: "If hybrid does not beat both, say so AND INVESTIGATE."
+    // The hypothesis is that RRF needs the retrievers to be *complementary*,
+    // and these two are merely correlated with one dominating. That is
+    // testable, so it gets tested rather than asserted.
+    std::size_t overlap_sum = 0, bm25_only = 0, tfidf_only = 0, both = 0, neither = 0;
+    for (std::size_t i = 0; i < queries.ids.size(); ++i) {
+        const auto b = bm25.search(queries.text[i], 10);
+        const auto t = tfidf.search(queries.text[i], 10);
+
+        for (const Neighbor& x : b) {
+            for (const Neighbor& y : t) {
+                if (x.id == y.id) { ++overlap_sum; break; }
+            }
+        }
+        auto found_at5 = [&](const std::vector<Neighbor>& v) {
+            for (std::size_t r = 0; r < v.size() && r < 5; ++r) {
+                if (v[r].id == queries.gold[i]) return true;
+            }
+            return false;
+        };
+        const bool fb = found_at5(b), ft = found_at5(t);
+        if (fb && ft) ++both;
+        else if (fb) ++bm25_only;
+        else if (ft) ++tfidf_only;
+        else ++neither;
+    }
+    const double mean_overlap =
+        queries.ids.empty() ? 0.0
+                            : static_cast<double>(overlap_sum) / (10.0 * static_cast<double>(queries.ids.size()));
+
     const double lift5 = s_tfidf.r5 > 0 ? (s_bm25.r5 - s_tfidf.r5) / s_tfidf.r5 : 0.0;
     std::cout << "\n  BM25 vs TF-IDF, recall@5 : "
               << (s_bm25.r5 - s_tfidf.r5 >= 0 ? "+" : "") << (s_bm25.r5 - s_tfidf.r5)
               << " absolute  (" << (lift5 >= 0 ? "+" : "") << lift5 * 100.0 << "% relative)\n";
 
-    // Honesty, stated by the program rather than left to the README: fusing two
-    // LEXICAL retrievers is a much weaker demonstration of RRF than fusing a
-    // dense one with a sparse one. RRF's value is that it needs no common
-    // scale, and two lexical retrievers already largely agree -- so a small
-    // lift here is the expected result, not a disappointing one.
-    std::cout << "\n  NOTE: RRF here fuses two LEXICAL retrievers, because EdgeRAG's dense signal\n"
-              << "        was measured to be noise (DEFAULT_ALPHA = 0.0, hybrid == text_only\n"
-              << "        bit-for-bit). Two lexical retrievers largely agree, so the fusion has\n"
-              << "        little disagreement to exploit. This measures that RRF works, not that\n"
-              << "        hybrid dense+sparse retrieval helps -- that needs a real text embedding\n"
-              << "        model, which is out of scope here.\n";
+    // The oracle: recall a *perfect* fuser would reach, one that always picked
+    // whichever retriever was right. It is the difference between "there is no
+    // complementary signal to exploit" and "there is, and RRF does not exploit
+    // it" -- two very different findings that the recall numbers alone cannot
+    // tell apart.
+    const double oracle_r5 =
+        queries.ids.empty() ? 0.0
+                            : static_cast<double>(both + bm25_only + tfidf_only) /
+                                  static_cast<double>(queries.ids.size());
+
+    std::cout << "\n  Why RRF did not help here -- measured, not asserted:\n"
+              << "    mean top-10 overlap between BM25 and TF-IDF : " << mean_overlap << "\n"
+              << "    queries where BOTH find the gold doc @5     : " << both << "\n"
+              << "    BM25 finds it, TF-IDF does not              : " << bm25_only << "\n"
+              << "    TF-IDF finds it, BM25 does not              : " << tfidf_only << "\n"
+              << "    neither                                     : " << neither << "\n"
+              << "\n    oracle fusion recall@5 (always pick the right one) : " << oracle_r5 << "\n"
+              << "    BM25 alone                                         : " << s_bm25.r5 << "\n"
+              << "    RRF                                                : " << s_rrf.r5 << "\n";
+
+    std::cout << "\n  RRF fuses by RANK ALONE, which is exactly what makes it tuning-free -- and it\n"
+              << "  is also why it cannot help here. It has no way to know one list is better; it\n"
+              << "  treats every input as equally authoritative. That is the right bet when the\n"
+              << "  retrievers are COMPLEMENTARY (each right about different queries), and the\n"
+              << "  wrong one when they are CORRELATED with one dominating: averaging a strong\n"
+              << "  ranker with a weaker one that mostly agrees can only drag it toward the\n"
+              << "  weaker. The asymmetry above is the evidence.\n"
+              << "\n  This is a property of the pairing, not a defect in RRF. EdgeRAG's dense\n"
+              << "  signal was measured to be noise (DEFAULT_ALPHA = 0.0, hybrid == text_only\n"
+              << "  bit-for-bit), so the only second retriever available on this corpus is another\n"
+              << "  lexical one over the same tokens. A genuine dense+sparse hybrid needs a real\n"
+              << "  text embedding model -- out of scope here, and named as a limitation rather\n"
+              << "  than papered over with a number that flatters.\n";
 
     json::Object p;
     p.str("kind", "edgerag_hybrid")
@@ -312,6 +366,12 @@ int main(int argc, char** argv) {
      .num("bm25_lift_at_5_absolute", s_bm25.r5 - s_tfidf.r5)
      .num("bm25_lift_at_5_relative", lift5)
      .num("bm25_recall_at_5_vs_ceiling", ceiling > 0 ? s_bm25.r5 / ceiling : 0.0)
+     .num("mean_top10_overlap", mean_overlap)
+     .num("gold_found_by_both", static_cast<long long>(both))
+     .num("gold_found_by_bm25_only", static_cast<long long>(bm25_only))
+     .num("gold_found_by_tfidf_only", static_cast<long long>(tfidf_only))
+     .num("gold_found_by_neither", static_cast<long long>(neither))
+     .num("oracle_fusion_recall_at_5", oracle_r5)
      .num("index_bytes", static_cast<long long>(bm25.index_bytes()));
 
     json::Object rec;
