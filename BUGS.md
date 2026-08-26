@@ -255,6 +255,62 @@ missing half its data with nobody noticing. Same shape as L-07: degrade, but nev
 
 ---
 
+### B-07 · k-means++ is not enough, and a test with random data hid it · 2026-08-22 · Phase 3
+
+**Symptom:** `TEST_CASE("k-means recovers obvious clusters")` failed on four well-separated blobs.
+Every other k-means test passed, including monotone inertia and the empty-cluster guard.
+
+**Wrong theory:** that the test threshold was too tight and should be loosened. It was the obvious
+move — one failing assertion among a dozen passing ones, on a threshold I had picked by hand — and
+it would have buried a real defect under a looser number.
+
+**Diagnosis.** Instead of adjusting the test, I dumped the actual cluster centres and ran the same
+data under four seeds:
+
+```
+seed=1  inertia/n = 1.112694     <- the failing case
+seed=2  inertia/n = 0.081034
+seed=3  inertia/n = 0.081034
+seed=7  inertia/n = 0.081034
+```
+
+Three seeds agree on 0.081034, which is *exactly* the expected jitter variance (2 dims × 0.2² =
+0.08). So the algorithm is right and seed 1 is stuck. Printing the centroids showed precisely how:
+two centroids sat inside the cluster at (1.4, −27.9), while the two clusters at (−21.9, 8.9) and
+(−22.4, 11.8) shared one centroid between them at (−22.2, 10.4).
+
+**Root cause, and it is two separate faults.**
+
+1. **The test data was not what the test claimed.** The helper drew cluster centres uniformly at
+   random, so two of four landed 2.9 apart while the jitter was 0.2. Distinct, but close enough
+   that k-means++ can seed both initial centroids inside one of them. **Test data that is "well
+   separated" on average is not well separated.**
+2. **The real gap: k-means++ reduces bad initialisations, it does not eliminate them.** Lloyd's
+   algorithm only ever moves centroids downhill, so "two centroids in one cluster, none in its
+   neighbour" is a state it can never escape. This is textbook behaviour and the standard
+   mitigation is restarts — which the implementation did not have.
+
+**Fix:** `KMeansParams::n_init` (default 3) runs the whole thing several times from different seeds
+and keeps the lowest inertia, reporting `inertia_per_init` so the spread is visible. The test data
+moved to a fixed grid, and a **new** regression test reproduces the original failing configuration
+exactly and asserts that restarts escape it.
+
+**Cost:** ~25 minutes.
+
+**Why it mattered beyond the test.** PQ trains one independent k-means per subspace — eight of them
+at m=8. A single unlucky seed in a single subspace produces one bad codebook, and that degrades
+recall for **every query**, in a way that looks like ordinary quantization error rather than a bug.
+Nothing would have pointed at k-means. The cost is real (n_init × training time) and it is the
+right trade for a component whose failure is invisible downstream.
+
+**The transferable lesson, and it is the one I would tell:** *a failing test is a hypothesis about
+your code, not a verdict on your threshold.* The cheap move — relax the assertion until it passes —
+would have left a genuine robustness hole in the component whose failures are hardest to attribute.
+Four seeds and a printout separated "my test is wrong" from "my code is fragile", and it turned out
+to be both.
+
+---
+
 ## Defused landmines
 
 Things that would have cost hours, caught before they did. **These count.** "I checked whether my
