@@ -75,7 +75,8 @@ def plottable(records: list[dict]) -> list[dict]:
 
 def recall_qps_curve(records: list[dict], out: Path) -> None:
     """The field-standard figure: recall on x, QPS on y, one point per ef_search."""
-    hnsw = [r for r in records if r["index"] == "hnsw" and r["measurements"].get("recall_at_k")]
+    hnsw = [r for r in records
+            if r["index"] in ("hnsw", "faiss_hnsw") and r["measurements"].get("recall_at_k")]
     flat = [r for r in records if r["index"] == "flat" and r["measurements"].get("recall_at_k")]
     if not hnsw:
         print("  no hnsw records with recall; skipping recall/QPS curve")
@@ -84,16 +85,19 @@ def recall_qps_curve(records: list[dict], out: Path) -> None:
     groups: dict[tuple, list[dict]] = {}
     for r in hnsw:
         p = r["index_params"]
-        groups.setdefault((r["n_base"], p["M"], p["ef_construction"]), []).append(r)
+        groups.setdefault((r["n_base"], p["M"], p["ef_construction"], r["index"]), []).append(r)
 
-    fig, ax = plt.subplots(figsize=(7.5, 5))
-    for (n, m, efc), rs in sorted(groups.items()):
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    for (n, m, efc, which), rs in sorted(groups.items()):
         rs.sort(key=lambda r: r["index_params"]["ef_search"])
         xs = [r["measurements"]["recall_at_k"] for r in rs]
         ys = [r["measurements"]["qps_mean"] for r in rs]
         errs = [r["measurements"]["qps_stddev"] for r in rs]
+        # FAISS dashed, VecCore solid -- the comparison is the point of the figure.
+        name = "FAISS IndexHNSWFlat" if which == "faiss_hnsw" else "VecCore HNSW"
         ax.errorbar(xs, ys, yerr=errs, marker="o", capsize=3,
-                    label=f"HNSW n={n:,} M={m} efC={efc}")
+                    ls="--" if which == "faiss_hnsw" else "-",
+                    label=f"{name}  n={n:,} M={m} efC={efc}")
         for r, x, y in zip(rs, xs, ys):
             ax.annotate(f"ef={r['index_params']['ef_search']}", (x, y),
                         textcoords="offset points", xytext=(5, 5), fontsize=7, alpha=0.7)
@@ -109,7 +113,7 @@ def recall_qps_curve(records: list[dict], out: Path) -> None:
     ax.set_yscale("log")
     ax.set_xlabel("recall@10")
     ax.set_ylabel("queries/sec (log scale)")
-    ax.set_title("Recall vs throughput, single thread\nsweeping ef_search; error bars are stddev over trials")
+    ax.set_title("Recall vs throughput, single thread, matched parameters\nsweeping ef_search; error bars are stddev over trials")
     ax.grid(alpha=0.3, which="both")
     ax.legend(fontsize=8)
     fig.tight_layout()
@@ -214,6 +218,55 @@ def pq_pareto(records: list[dict], out: Path) -> None:
     fig.suptitle(f"Product Quantization Pareto, SIFT1M ({raw and ''}single thread)", y=1.0)
     fig.tight_layout()
     path = out / "pq_pareto.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  wrote {path}")
+
+
+def crossover(records: list[dict], out: Path) -> None:
+    """Where HNSW starts beating brute force, with EdgeRAG's corpus marked.
+
+    D7 / L-03: "HNSW made EdgeRAG faster" is false at 362 documents. This is the
+    figure that replaces the claim with a number.
+    """
+    rs = [r for r in records if r["index_params"].get("kind") == "crossover"]
+    if not rs:
+        print("  no crossover records; skipping")
+        return
+    r = rs[-1]
+    rows = r["measurements"]["rows"]
+    ns = [x["n"] for x in rows]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(ns, [x["flat_ms"] for x in rows], marker="o", label="brute force (exact)")
+    ax.plot(ns, [x["hnsw_ms"] for x in rows], marker="s",
+            label=f"HNSW (ef_search={r['index_params']['ef_search']})")
+
+    cx = r["measurements"].get("crossover_n")
+    if cx:
+        ax.axvline(cx, ls="--", lw=1, color="seagreen")
+        ax.annotate(f"crossover\nn = {cx:,}", (cx, min(x["hnsw_ms"] for x in rows)),
+                    fontsize=9, color="seagreen", ha="left",
+                    textcoords="offset points", xytext=(6, 0))
+
+    eg = r["index_params"]["edgerag_n"]
+    eg_row = next((x for x in rows if x["n"] == eg), None)
+    slower = f"\nHNSW is {(1 - eg_row['speedup']) * 100:.0f}% SLOWER here" if eg_row else ""
+    ax.axvline(eg, ls="--", lw=1.5, color="firebrick")
+    ax.annotate(f"EdgeRAG's corpus\nn = {eg}{slower}",
+                (eg, max(x["flat_ms"] for x in rows) * 0.25), fontsize=9,
+                color="firebrick", ha="right", textcoords="offset points", xytext=(-8, 0))
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("corpus size (log scale)")
+    ax.set_ylabel("ms per query (log scale)")
+    ax.set_title("When does HNSW actually beat brute force?\n"
+                 "128-dim, k=10, single thread -- the graph overhead has to be paid back first")
+    ax.grid(alpha=0.3, which="both")
+    ax.legend()
+    fig.tight_layout()
+    path = out / "crossover.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"  wrote {path}")
@@ -344,7 +397,7 @@ def markdown_table(records: list[dict], out: Path) -> None:
     for r in records:
         m, p = r["measurements"], r["index_params"]
         if p.get("kind") in ("layout_ab", "thread_scaling", "writer_starvation",
-                             "edgerag_hybrid"):
+                             "edgerag_hybrid", "crossover"):
             continue
         rows.append({
             "index": r["index"],
@@ -398,6 +451,7 @@ def main() -> int:
     recall_qps_curve(records, out)
     latency_distribution(records, out)
     pq_pareto(records, out)
+    crossover(records, out)
     thread_scaling(records, out)
     writer_starvation(records, out)
     layout_ab(records, out)

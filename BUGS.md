@@ -18,9 +18,36 @@ story is what the interview is actually about.
 
 ## The answer, if you only read one section
 
-> *To be written once there is a real answer.* Leave it empty rather than filling it with something
-> minor — this section exists to hold the single hardest bug, and pre-filling it with a placeholder
-> that reads like a diagnosis is exactly the failure mode described in P-30.
+**B-11 — four readers stop the index accepting writes.**
+
+A concurrent read+insert test hung for ten minutes at 400% CPU. The cheap read was "ASan is slow,
+lower the loop count", which would have made the test pass and shipped the behaviour. Instead I
+built a standalone Release probe and swept reader count against a fixed 200 inserts:
+
+```
+readers=0   4.0 ms total   worst insert 0.05 ms
+readers=1  15.2 ms         worst 0.31 ms
+readers=2 278.6 ms         worst 7.83 ms
+readers=4  DID NOT COMPLETE in 30 s
+```
+
+Not a slowdown — a cliff. `std::shared_mutex` on libstdc++ is a `pthread_rwlock_t` and **glibc's
+default is reader-preferring**: a reader arriving while other readers hold the lock is admitted
+immediately even with a writer queued, so with continuous search traffic the reader count never
+reaches zero and the writer's `unique_lock` is never grantable. A vector index is *the* canonical
+many-readers-occasional-writer workload, so this is the wrong standard-library default for exactly
+this use case — and `std::shared_mutex` exposes no way to change it.
+
+Fixed with a ~10-line turnstile: a plain mutex readers touch briefly on the way in, which a writer
+**holds across its entire wait**, so new readers queue behind it instead of overtaking it. Insert
+p99 under 4 readers: **11,902 ms → 1.54 ms**, and the thread-scaling table shows it costs read
+throughput nothing measurable.
+
+**Why this one and not a subtler bug:** it is the only bug here where the *symptom* was a hung
+test rather than a wrong number, and where the honest fix and the convenient fix pointed in
+opposite directions. **A test that hangs is reporting a result.** When a test is slow, find out
+whether it is slow or stopped — those are different findings, and only one of them is a bug in
+the code rather than the test.
 
 ---
 
@@ -39,6 +66,7 @@ story is what the interview is actually about.
 | B-09 | `git stash pop` failed on conflict and reported it as reassurance | untested code path | ~3 min |
 | B-10 | A `const` search method wrote to shared members; TSan-confirmed race | data race | ~20 min |
 | B-11 | **4 readers starve the writer entirely — inserts stop happening** | data race / starvation | ~45 min |
+| B-12 | An unmeasured number in the *limitations* section, overstating our own gap 7× | baseline mismatch | ~5 min |
 
 **Phase 0 scorecard:** 7 landmines defused, 0 confirmed bugs, ~1.5 h. Four of the seven
 (L-01, L-02, L-05, L-06) were found by checking a tool *before* depending on it rather than after.
@@ -533,6 +561,42 @@ cheap read was "ASan is slow, lower the loop count"; the test would then have pa
 shipped default silently could not accept a write under load. **When a test is slow, find out
 whether it is slow or stopped** — those are different findings, and only one of them is a bug in
 the code rather than the test.
+
+---
+
+### B-12 · I put an unmeasured number in the limitations section · 2026-08-22 · Phase 6
+
+**Symptom.** The README's limitations section said, of HNSW build time:
+
+> *"1,139 s for SIFT1M, single-threaded. **FAISS does this in a small number of minutes.**"*
+
+Then Phase 6 actually ran `IndexHNSWFlat` on the same data, same `M`, same `ef_construction`,
+same single thread: **753 s**. We are **1.51× slower**, not the ~10× that sentence implies.
+
+**Root cause.** The 753 s number did not exist when the sentence was written. What existed was
+FAISS's *PQ* training time — 1.7 s against our 86.5 s, a real 50× gap — and I generalised from the
+component I had measured to the one I had not. FAISS's HNSW construction is dominated by the same
+distance computations ours is, and it turns out not to have anything like PQ's advantage.
+
+**Why this is the worst place in the repo to put a guess.** `00_FOUNDATIONS.md` §6 says the
+limitations section *"signals more maturity than any other section"* — which is exactly why an
+unverified claim there does the most damage. A reader who checks it finds the one number in the
+document that was not measured, sitting in the section whose entire purpose is that it was. And it
+was **self-deprecating**, which is what made it feel safe to write: understating your own result
+does not feel like overclaiming, so it skips the check that a flattering number would have
+triggered.
+
+**Fix.** The sentence now carries the measured comparison: 1,139 s vs 753 s, 1.51×, with the
+specific causes that remain true (single-threaded insert, no cached distances in the backward
+shrink, `n_init=3` on the PQ side).
+
+**Cost:** ~5 minutes to fix, and it was only caught because the FAISS HNSW comparison was a
+never-cut deliverable that happened to measure exactly this.
+
+**The rule this earns:** *every number in the limitations section needs a record behind it, the
+same as every number in the results table.* D10 rule 7 said "every number in the README traces to a
+record in `results/`" and I had been reading that as applying to the *claims*. It applies to the
+**caveats** too — arguably more, because nobody fact-checks a confession.
 
 ---
 
