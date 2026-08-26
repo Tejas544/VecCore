@@ -284,6 +284,43 @@ so it will not crash — and if the curve is unchanged, it was memory bandwidth 
 not the lock. A confident wrong explanation is worse than "I measured this and I am not certain
 why."
 
+### REVISED 2026-08-22 — measured, and P-30 fired exactly as predicted
+
+**The lock is not the limiter, and the control proves it.** Read-only scaling with the lock
+*entirely removed* (`LockMode::None`) is indistinguishable from `shared_mutex` at every thread
+count — at 200k vectors and 12 threads: 14,994 / 15,172 / 14,701 QPS for none / shared_mutex /
+writer_priority, a ~3% spread that is inside the trial-to-trial noise. **"It stops scaling because
+of lock contention" would have been a confident, plausible, wrong sentence.**
+
+**What does limit it, with evidence.** Running the same sweep at two working-set sizes:
+
+| threads | n=10K (4.9 MiB, fits in 12 MB L3) | n=200K (98 MiB, exceeds L3) |
+|---|---|---|
+| 2 | 2.00× (100%) | 1.74× (87%) |
+| 4 | 3.37× (84%) | 2.84× (71%) |
+| 6 | 4.07× (68%) | 3.36× (56%) |
+| 8 | 4.96× (62%) | 3.89× (49%) |
+| 12 | 5.59× (47%) | 4.16× (35%) |
+
+The out-of-cache workload loses **~12 points of scaling efficiency at every thread count**. That is
+memory bandwidth, isolated by changing only the working-set size. Beyond 6 threads both curves
+flatten because threads 7–12 are hyperthreads sharing execution units with a loop that already
+saturates them — 8→12 threads buys 3.89→4.16× at 200k, almost nothing. Turbo clock reduction as
+more cores engage is a third contributor and is not separated out here; saying so is more honest
+than attributing the whole residual to bandwidth.
+
+### AMENDED 2026-08-22 — the default lock mode changed, because the old one stops accepting writes
+
+`LockMode::WriterPriority` is now the default, not `SharedMutex`. See **B-11**: glibc's
+`shared_mutex` is reader-preferring, so four continuous readers starve the writer *completely* —
+5 of 200 inserts in 36 seconds, insert p50 **8.2 seconds**. A turnstile mutex fixes it at no
+measurable read cost: insert p99 under 4 readers goes **4,446 ms → 0.79 ms**.
+
+This is the decision that changed most on contact with measurement, and the reason is worth
+keeping: the original entry said "coarse and correct beats fine-grained and racy". That was right
+about *correctness* and silent about *liveness*. A lock can be perfectly correct and still make the
+index unable to accept a write.
+
 ---
 
 ## D9 · Cut order extends the spec's by one item · **ACCEPTED** · 2026-08-21
