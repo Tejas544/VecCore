@@ -3,8 +3,8 @@
 **An HNSW vector index with Product-Quantization compression and hybrid dense+sparse retrieval,
 written from scratch in C++17 and benchmarked against FAISS.**
 
-> **Status: Phase 3 complete — HNSW and Product Quantization both verified against ground truth
-> on SIFT1M, and both benchmarked head-to-head against FAISS.** Next: hybrid BM25+RRF retrieval.
+> **Status: Phase 4 complete — HNSW, Product Quantization and BM25 all verified; HNSW and PQ
+> benchmarked head-to-head against FAISS.** Next: concurrency and thread scaling.
 > This README is deliberately empty of numbers. Every claim below the line will arrive with a JSON
 > record in [`results/`](results/) and the git SHA that produced it — see `CONTEXT.md` D10. If you
 > are reading this and a number has no record behind it, that is a bug in the README.
@@ -165,6 +165,50 @@ records code bytes, codebook bytes and total footprint as separate fields and ne
 Quoting 64× compression for a configuration that keeps the uncompressed vectors in RAM would be
 exactly the overclaiming `WHAT_IS_THIS.md` §10 criticises.
 
+### Hybrid retrieval — BM25 on EdgeRAG's real corpus
+
+362 documents, **650 real held-out queries**, measured against EdgeRAG's own TF-IDF implementation
+with an identical tokenizer, so the comparison isolates the three things that actually differ.
+
+| retriever | recall@1 | recall@5 | recall@10 | ÷ ceiling | p50 latency |
+|---|---|---|---|---|---|
+| TF-IDF (EdgeRAG today) | 0.0400 | 0.1846 | 0.2738 | 48.0% | 0.0359 ms |
+| **BM25 (VecCore)** | **0.0446** | **0.1923** | **0.2862** | **50.0%** | **0.0034 ms** |
+| RRF(BM25, TF-IDF) | 0.0400 | 0.1862 | 0.2769 | 48.4% | 0.0432 ms |
+
+**BM25 wins on both axes: +4.17% relative recall@5 and 11× lower latency.** The latency half is
+algorithmic rather than a micro-optimisation — an inverted index touches only documents containing
+a query term, while the TF-IDF implementation scores all 362.
+
+**The ceiling column is not decoration.** 112 of 362 documents have no OCR text at all, so 400 of
+650 queries are unreachable by *any* text retriever. **No text-only method can exceed recall
+0.3846 on this corpus.** Quoting these numbers against 1.0 would make a 50%-of-achievable result
+look like a 19% failure.
+
+**RRF made things worse, and that is reported rather than dropped.** `PLAN.md` §4.5 pre-committed
+to reporting the result either way, before it was known. The investigation:
+
+```
+mean top-10 overlap between BM25 and TF-IDF : 0.4915
+BM25 finds the gold doc, TF-IDF does not    :  13 queries
+TF-IDF finds it, BM25 does not              :   8 queries
+
+oracle fusion recall@5 (always pick correctly) : 0.2046
+BM25 alone                                     : 0.1923
+RRF                                            : 0.1862
+```
+
+So complementary signal genuinely exists — **+6.4% is on the table** — and RRF captures none of it.
+**RRF fuses by rank alone, which is exactly what makes it tuning-free and also what makes it
+authority-blind:** it has no way to know one input dominates, so it averages a stronger ranker with
+a weaker one that mostly agrees. That is the right bet for *complementary* retrievers and the wrong
+one for *correlated* ones. Full write-up in [`BUGS.md`](BUGS.md) B-08.
+
+A genuine dense+sparse hybrid could not be measured here — EdgeRAG's dense signal was measured to
+be noise (`DEFAULT_ALPHA = 0.0`), so the only second retriever available is another lexical one
+over the same tokens. That is a limitation of the data, named rather than substituted with a
+number that flatters.
+
 **Memory layout (D5)** — 200,000 vectors, 98 MiB, past this CPU's 12 MB L3:
 
 ![layout](docs/plots/layout_ab.png)
@@ -205,6 +249,9 @@ the end is a limitations section that flatters:
   sample size rather than left implicit.
 - **Approximate with no bound.** Recall is measured on a test set. Nothing guarantees it holds on
   data that drifts.
+- **The spec's "+3–10% hybrid recall lift" target is not achievable on the available data.**
+  It needs a dense retriever that is complementary to the sparse one; EdgeRAG's dense signal is
+  measured noise. BM25-over-TF-IDF (+4.17%) is what this corpus can actually demonstrate.
 - **PQ codebook training is 50× slower than FAISS** (86.5 s vs 1.7 s at m=8). The cause is known
   and specific: our k-means assignment step is a triple loop over (points × centroids × dims),
   while FAISS expresses the same step as a matrix multiply and hands it to BLAS. Writing a blocked

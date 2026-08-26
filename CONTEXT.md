@@ -357,6 +357,54 @@ estimate made before measuring; the code was never wrong. See `PLAN.md` §4.
 
 ---
 
+## D13 · Hybrid retrieval on EdgeRAG: BM25 ships, RRF is reported as a negative · **ACCEPTED** · 2026-08-22
+
+**Decision.** EdgeRAG's TF-IDF is replaced by BM25. RRF is implemented, tested, and **reported as a
+measured negative on this corpus** rather than quietly omitted or presented with a flattering
+configuration.
+
+**Measured**, 362 documents, 650 real queries, structural ceiling 0.3846:
+
+| retriever | recall@1 | recall@5 | recall@10 | ÷ ceiling | p50 |
+|---|---|---|---|---|---|
+| TF-IDF (EdgeRAG today) | 0.0400 | 0.1846 | 0.2738 | 48.0% | 0.0359 ms |
+| **BM25** | **0.0446** | **0.1923** | **0.2862** | **50.0%** | **0.0034 ms** |
+| RRF(BM25, TF-IDF) | 0.0400 | 0.1862 | 0.2769 | 48.4% | 0.0432 ms |
+
+**BM25 wins on both axes: +4.17% relative recall@5 and 11× lower latency.** The latency half is not
+a micro-optimisation — it is algorithmic. An inverted index touches only documents containing a
+query term; the TF-IDF implementation scores every document in the corpus. Same tokenizer, same
+data, different data structure.
+
+**Why the recall lift is modest, stated so nobody has to ask.** Both are lexical retrievers over the
+same tokens with the same tokenizer. The three things that differ are term-frequency saturation
+(`k1`), explicit length normalisation (`b`), and the IDF form. On short OCR text with few repeated
+terms, saturation has little to bite on. A +4% relative lift is what those three changes are worth
+here, and claiming more would require a different corpus, not a different argument.
+
+**Why RRF is reported as a negative.** See B-08. Briefly: RRF fuses by rank alone, which is what
+makes it tuning-free and also what makes it authority-blind. It cannot know one input dominates.
+Measured: 49% top-10 overlap, BM25 uniquely right on 13 queries against TF-IDF's 8, and an **oracle
+fuser would reach 0.2046 against BM25's 0.1923** — so +6.4% of complementary signal genuinely
+exists and RRF captures none of it.
+
+**Rejected: dropping RRF from the report because the number is unflattering.** `PLAN.md` §4.5
+pre-committed to reporting it either way, before the number was known. A null result that was
+pre-registered and then investigated is worth more in an interview than a lift that was found by
+trying configurations until one worked.
+
+**Rejected: weighted score fusion to capture the headroom.** It would work here, and it would cost
+the one property RRF exists for — a weight fitted to this corpus is wrong on the next one. The
+trade is now stated with a number attached rather than asserted.
+
+**Scope limitation, named rather than papered over.** A genuine dense+sparse hybrid — where the two
+retrievers really are complementary — **could not be measured on this corpus**, because EdgeRAG's
+dense signal was measured to be noise (`DEFAULT_ALPHA = 0.0`). It needs a real text embedding model,
+which is out of scope. The `+3-10% hybrid lift` in `02_VECCORE.md` §6's target table is therefore
+**not achievable on the data available**, and that is a data limitation, not an implementation one.
+
+---
+
 ## D11 · No hand-written SIMD unless it is measured to matter · **PROPOSED** · 2026-08-21
 
 **Decision.** Compile `-O3 -march=native`, verify with `-fopt-info-vec-optimized` that the distance
