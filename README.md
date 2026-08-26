@@ -3,8 +3,9 @@
 **An HNSW vector index with Product-Quantization compression and hybrid dense+sparse retrieval,
 written from scratch in C++17 and benchmarked against FAISS.**
 
-> **Status: Phase 5 complete — HNSW, PQ, BM25 and concurrent search all verified; HNSW and PQ
-> benchmarked head-to-head against FAISS.** Next: Python bindings and the EdgeRAG integration.
+> **Status: complete.** All six phases shipped and gated. HNSW, Product Quantization, BM25+RRF
+> and concurrent search, benchmarked head-to-head against FAISS on identical data with matched
+> parameters and matched thread counts.
 > This README is deliberately empty of numbers. Every claim below the line will arrive with a JSON
 > record in [`results/`](results/) and the git SHA that produced it — see `CONTEXT.md` D10. If you
 > are reading this and a number has no record behind it, that is a bug in the README.
@@ -148,6 +149,38 @@ asserting it — that script is the answer to "why isn't it 1.0?".
 The level histogram is not decoration. `mL = 1/ln(M)` is easy to get wrong (`1/M` and `ln(M)` are
 both plausible), nothing errors when you do, and the only symptom is a badly shaped hierarchy. The
 ratios matching 1/M to three decimal places is the evidence that it is right.
+
+### Head-to-head with FAISS — SIFT1M, matched `M`/`ef_construction`/`ef_search`, both single-threaded
+
+This is the table the project exists to be able to show. `02_VECCORE.md` set the bar at
+*"within 2–3× of FAISS is a good solo result."*
+
+| ef_search | VecCore recall@10 | FAISS recall@10 | VecCore QPS | FAISS QPS | FAISS faster by |
+|---|---|---|---|---|---|
+| 10 | 0.7244 | 0.7044 | 8,033 | 14,001 | 1.74× |
+| 40 | 0.9290 | 0.9288 | 3,288 | 5,739 | 1.75× |
+| **80** | **0.9755** | 0.9770 | **1,934** | 3,216 | **1.66×** |
+| 160 | 0.9935 | 0.9946 | 1,079 | 1,778 | 1.65× |
+| 320 | 0.9987 | 0.9987 | 595 | 956 | 1.61× |
+| **build** | | | **1,139 s** | **753 s** | **1.51×** |
+
+**Recall matches to within 0.002 at every point on the curve** — slightly ahead at low `ef_search`,
+slightly behind at high. That is the correctness result: this HNSW builds a graph of equivalent
+quality to the reference implementation. Throughput is **1.6–1.75× behind**, inside the spec's
+target band, and build time is 1.51× behind.
+
+`faiss.omp_set_num_threads(1)` is set explicitly (P-32) — FAISS defaults to every core, and
+comparing that against a single-threaded search would be a 6× error in its favour and the first
+thing anyone competent would ask about.
+
+**PQ, same treatment** — `IndexPQ`, same `m`, same 100k training subsample:
+
+| m | compression | VecCore recall@10 | FAISS recall@10 | VecCore QPS | FAISS QPS |
+|---|---|---|---|---|---|
+| 8 | 64× | **0.3125** | 0.3101 | 164 | 191 |
+| 32 | 16× | **0.7186** | 0.7059 | 55 | 62 |
+
+Marginally ahead of the reference on recall, at 0.85–0.89× its throughput.
 
 ### Product Quantization — compression, and what it costs
 
@@ -308,6 +341,50 @@ prefetcher can predict. The first version of this benchmark reported the naive l
 The FAISS head-to-head arrives in Phase 6, measured in the same session on the same machine with
 matched thread counts, interleaved A/B/A/B.
 
+### Integrating with EdgeRAG — three claims that survive a follow-up question
+
+![crossover](docs/plots/crossover.png)
+
+`python/veccore/edgerag.py` implements EdgeRAG's `RetrievalIndex` protocol — the one whose docstring
+was written months before this repo existed and reads *"``VecCore`` implements this later without
+touching a caller."* It does, and no call site changes.
+
+The pitch everyone reaches for is "VecCore made EdgeRAG's retrieval faster with HNSW." **It is
+false, and `bench/crossover.py` measures exactly how false:**
+
+| n | brute force | HNSW | |
+|---|---|---|---|
+| **362** | **0.0330 ms** | **0.0570 ms** | **HNSW is 42% SLOWER — EdgeRAG's actual corpus** |
+| 1,189 | — | — | crossover |
+| 10,000 | 1.0985 ms | 0.3012 ms | 3.65× |
+| 100,000 | 10.5510 ms | 0.6786 ms | 15.55× |
+
+EdgeRAG's corpus sits **3.3× below the crossover**. Graph traversal costs more than the scan it
+avoids. So the three claims actually delivered are:
+
+1. **No regression** — same protocol, same call sites, recall at least as good as the TF-IDF index
+   it replaces. Checked in `tests/test_edgerag_adapter.py` against the real 650-query set.
+2. **A real quality upgrade** — TF-IDF → BM25, **+4.17% relative recall@5** at **11× lower
+   latency**, measured above.
+3. **A scaling argument that is measured rather than asserted** — the curve above, with EdgeRAG's
+   position marked on it.
+
+`use_hnsw` therefore defaults to **False** in the adapter. Turning it on at 362 documents would make
+retrieval slower for the sake of a nicer architecture diagram.
+
+## Using it from Python
+
+```python
+import veccore
+
+index = veccore.HnswIndex(vectors, M=16, ef_construction=200)   # (n, dim) float32
+ids, distances = index.search(query, k=10, ef_search=64)        # squared L2
+```
+
+The GIL is released around every search (P-35), so threading through the binding actually overlaps:
+**4 threads take 1.35× the single-threaded time for 4× the work**. A held GIL would show 4.0×, and
+nothing in the C++ benchmark would have noticed — which is why `tests/test_bindings.py` exists.
+
 ## Design decisions
 
 See [`CONTEXT.md`](CONTEXT.md). The ones most worth reading: D4 (squared L2, and why cosine is not
@@ -344,11 +421,12 @@ the end is a limitations section that flatters:
   while FAISS expresses the same step as a matrix multiply and hands it to BLAS. Writing a blocked
   GEMM was out of scope for the time available (`PLAN.md` §0.3); `n_init=3` restarts also triple
   the cost by design (B-07). Reported, not excused.
-- **Build time is bad: 1,139 s for SIFT1M, single-threaded.** FAISS does this in a small number of
-  minutes. Three known reasons, none of them mysterious: insertion is single-threaded; the backward
-  link shrink recomputes a neighbour's whole distance list every time it overflows, where hnswlib
-  caches them; and `select_neighbors_heuristic` is O(M²) distance calls per insert with no reuse.
-  This is measured, reported, and not excused — see the Phase 6 comparison when it lands.
+- **Build time is 1,139 s for SIFT1M, single-threaded — 1.51× FAISS's 753 s** on identical
+  parameters. Three known causes: insertion is single-threaded; the backward link shrink recomputes
+  a neighbour's whole distance list on every overflow where hnswlib caches them; and
+  `select_neighbors_heuristic` is O(M²) distance calls per insert with no reuse. *(An earlier draft
+  of this line claimed FAISS was ~10× faster here, generalising from the PQ result. It was wrong and
+  it was in the limitations section, which is the worst place in the repo to guess — B-12.)*
 - Plus whatever `PLAN.md` §0.3's cut order takes, which will be listed here by name.
 
 ## Reproducing
