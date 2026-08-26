@@ -116,7 +116,9 @@ add_library(veccore STATIC
   src/xvecs.cpp
   src/hnsw.cpp
   src/kmeans.cpp
-  src/pq.cpp)
+  src/pq.cpp
+  src/bm25.cpp
+  src/fusion.cpp)
 
 target_include_directories(veccore PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -133,6 +135,11 @@ if(VECCORE_ASAN)
   add_executable(asan_probe tools/asan_probe.cpp)
   target_link_libraries(asan_probe PRIVATE veccore)
 endif()
+
+# EdgeRAG hybrid evaluation (D7). Lives in tools/ because the TF-IDF baseline
+# it contains is a baseline, not a component -- same treatment as FAISS.
+add_executable(hybrid_eval tools/hybrid_eval.cpp)
+target_link_libraries(hybrid_eval PRIVATE veccore)
 
 if(VECCORE_BUILD_TESTS)
   enable_testing()
