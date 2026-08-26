@@ -15,7 +15,8 @@ add_executable(veccore_tests
   test_phase1.cpp
   test_hnsw.cpp
   test_pq.cpp
-  test_bm25.cpp)
+  test_bm25.cpp
+  test_concurrent.cpp)
 
 target_link_libraries(veccore_tests PRIVATE veccore doctest::doctest)
 

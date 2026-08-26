@@ -13,6 +13,7 @@
 // CPU; run all of A then all of B and part of what you measured is how hot the
 // laptop got.
 
+#include "veccore/concurrent.hpp"
 #include "veccore/distance.hpp"
 #include "veccore/flat_index.hpp"
 #include "veccore/hnsw.hpp"
@@ -24,6 +25,7 @@
 #include "veccore/xvecs.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
@@ -33,6 +35,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace veccore;
@@ -41,7 +44,7 @@ namespace {
 
 struct Args {
     std::string tag = "flat";
-    std::string index = "flat";          // flat | hnsw | pq
+    std::string index = "flat";          // flat | hnsw | pq | threads
     std::string out = "results/bench.jsonl";
     std::string base, query, truth;
     std::size_t k = 10;
@@ -58,6 +61,7 @@ struct Args {
     std::size_t pq_iters = 25;
     std::size_t pq_n_init = 3;
     std::vector<std::size_t> pq_rerank{0, 100};
+    std::vector<std::size_t> threads{1, 2, 4, 6, 8, 12};
     bool layout_ab = false;
     bool allow_untrusted = false;
     bool help = false;
@@ -66,7 +70,7 @@ struct Args {
 void usage() {
     std::cout <<
         "usage: bench --base F.fvecs --query F.fvecs [--truth F.ivecs] [options]\n"
-        "  --index flat|hnsw|pq  which index (default: flat)\n"
+        "  --index NAME       flat|hnsw|pq|threads (default: flat)\n"
         "  --tag NAME          label for the record\n"
         "  --out PATH          JSONL to append to\n"
         "  --k N               neighbours to retrieve (default: 10)\n"
@@ -83,6 +87,7 @@ void usage() {
         "  --pq-iters N        k-means iterations (default: 25)\n"
         "  --pq-n-init N       k-means restarts, lowest inertia kept (default: 3)\n"
         "  --pq-rerank A,B     exact-rescore shortlist sizes; 0 = ADC only (default: 0,100)\n"
+        "  --threads A,B,C     thread counts for --index threads (default: 1,2,4,6,8,12)\n"
         "  --layout-ab         also run the D5 flat-vs-pointer-chasing comparison\n"
         "  --allow-untrusted   write a record from a Debug/sanitized/dirty build\n";
 }
@@ -106,7 +111,7 @@ Args parse(int argc, char** argv) {
             return argv[++i];
         };
         if      (arg == "--tag")             a.tag = next("a value");
-        else if (arg == "--index")           a.index = next("flat|hnsw|pq");
+        else if (arg == "--index")           a.index = next("flat|hnsw|pq|threads");
         else if (arg == "--out")             a.out = next("a path");
         else if (arg == "--base")            a.base = next("a path");
         else if (arg == "--query")           a.query = next("a path");
@@ -125,6 +130,7 @@ Args parse(int argc, char** argv) {
         else if (arg == "--pq-iters")        a.pq_iters = std::stoul(next("a number"));
         else if (arg == "--pq-n-init")       a.pq_n_init = std::stoul(next("a number"));
         else if (arg == "--pq-rerank")       a.pq_rerank = parse_list(next("a list"));
+        else if (arg == "--threads")         a.threads = parse_list(next("a list"));
         else if (arg == "--layout-ab")       a.layout_ab = true;
         else if (arg == "--allow-untrusted") a.allow_untrusted = true;
         else if (arg == "-h" || arg == "--help") a.help = true;
@@ -216,8 +222,9 @@ int main(int argc, char** argv) {
         usage();
         return args.help ? 0 : 2;
     }
-    if (args.index != "flat" && args.index != "hnsw" && args.index != "pq") {
-        std::cerr << "bench: --index must be flat, hnsw or pq\n";
+    if (args.index != "flat" && args.index != "hnsw" && args.index != "pq" &&
+        args.index != "threads") {
+        std::cerr << "bench: --index must be flat, hnsw, pq or threads\n";
         return 2;
     }
 
@@ -472,6 +479,150 @@ int main(int argc, char** argv) {
             std::cout << "\n";
         }
         std::cout << "  peak RSS   : " << peak_rss_mib() << " MiB\n";
+    }
+
+    // ---- thread scaling ---------------------------------------------------
+    if (args.index == "threads") {
+        HnswParams hp;
+        hp.M = args.M;
+        hp.ef_construction = args.ef_construction;
+        hp.seed = args.seed;
+        const std::size_t ef = args.ef_search.empty() ? 64 : args.ef_search.front();
+
+        for (const LockMode mode : {LockMode::None, LockMode::SharedMutex, LockMode::WriterPriority}) {
+            ConcurrentHnsw index(base, hp, mode);
+            const auto t_build = Clock::now();
+            index.build();
+            const double build_ms = ms_since(t_build);
+            std::cout << "\n  lock mode: " << to_string(mode)
+                      << "   (built in " << build_ms / 1000.0 << " s, ef_search=" << ef << ")\n";
+
+            double single_qps = 0.0;
+            for (const std::size_t nt : args.threads) {
+                std::vector<double> qps_trials;
+
+                for (int trial = 0; trial < args.trials; ++trial) {
+                    std::atomic<std::uint64_t> done{0};
+                    std::vector<std::thread> workers;
+                    const auto t0 = Clock::now();
+
+                    for (std::size_t t = 0; t < nt; ++t) {
+                        workers.emplace_back([&, t] {
+                            // P-28: each thread gets a DISJOINT slice of the
+                            // query set. All threads issuing the same query
+                            // would leave the graph path hot in L2 after the
+                            // first, producing a beautifully linear curve that
+                            // measures cache behaviour rather than concurrency.
+                            SearchScratch scratch = index.make_scratch();
+                            std::uint64_t local = 0;
+                            for (vec_id_t q = static_cast<vec_id_t>(t); q < queries.size();
+                                 q += static_cast<vec_id_t>(nt)) {
+                                volatile auto s = index.search(queries.at(q), args.k, ef, scratch).size();
+                                (void)s;
+                                ++local;
+                            }
+                            done.fetch_add(local, std::memory_order_relaxed);
+                        });
+                    }
+                    for (auto& w : workers) w.join();
+                    const double elapsed = ms_since(t0);
+                    qps_trials.push_back(static_cast<double>(done.load()) / (elapsed / 1000.0));
+                }
+
+                const double qps = mean_of(qps_trials);
+                const double sd = stddev(qps_trials);
+                if (nt == 1) single_qps = qps;
+                const double speedup = single_qps > 0.0 ? qps / single_qps : 1.0;
+
+                std::cout << std::fixed << std::setprecision(2)
+                          << "    " << std::setw(2) << nt << " threads : "
+                          << std::setw(10) << qps << " QPS +/- " << std::setw(7) << sd
+                          << "   speedup " << std::setw(6) << speedup << "x"
+                          << "   efficiency " << std::setw(6)
+                          << (speedup / static_cast<double>(nt) * 100.0) << "%\n";
+
+                json::Object p;
+                p.str("kind", "thread_scaling")
+                 .str("lock_mode", to_string(mode))
+                 .num("threads", static_cast<long long>(nt))
+                 .num("M", static_cast<long long>(hp.M))
+                 .num("ef_construction", static_cast<long long>(hp.ef_construction))
+                 .num("ef_search", static_cast<long long>(ef))
+                 .num("seed", static_cast<long long>(hp.seed));
+                json::Object m;
+                m.num("qps_mean", qps).num("qps_stddev", sd)
+                 .array("qps_per_trial", qps_trials)
+                 .num("speedup", speedup)
+                 .num("efficiency", speedup / static_cast<double>(nt))
+                 .num("build_ms", build_ms)
+                 .raw("recall_at_k", "null");
+                write_record(m, p);
+            }
+        }
+
+        // --- writer starvation, B-11 --------------------------------------
+        // The measurement that turned "the lock is coarse" into a specific,
+        // reproducible pathology. Insert latency under a continuous read load,
+        // for each lock mode.
+        std::cout << "\n  writer latency under continuous read load (B-11):\n";
+        for (const LockMode mode : {LockMode::SharedMutex, LockMode::WriterPriority}) {
+            ConcurrentHnsw index(base, hp, mode);
+            const vec_id_t seed_n = base.size() / 2;
+            for (vec_id_t i = 0; i < seed_n; ++i) index.insert(i);
+
+            for (const std::size_t nr : {std::size_t{0}, std::size_t{2}, std::size_t{4}}) {
+                std::atomic<bool> stop{false};
+                std::vector<std::thread> readers;
+                for (std::size_t t = 0; t < nr; ++t) {
+                    readers.emplace_back([&] {
+                        SearchScratch scratch = index.make_scratch();
+                        while (!stop.load(std::memory_order_relaxed)) {
+                            volatile auto s = index.search(base.at(0), args.k, ef, scratch).size();
+                            (void)s;
+                        }
+                    });
+                }
+
+                constexpr int kInserts = 200;
+                std::vector<double> lat;
+                lat.reserve(kInserts);
+                const auto t0 = Clock::now();
+                bool gave_up = false;
+                for (int i = 0; i < kInserts; ++i) {
+                    const auto ti = Clock::now();
+                    index.insert(seed_n + static_cast<vec_id_t>(i));
+                    lat.push_back(ms_since(ti));
+                    if (ms_since(t0) > 30000.0) { gave_up = true; break; }  // starvation guard
+                }
+                const double total = ms_since(t0);
+                stop.store(true);
+                for (auto& r : readers) r.join();
+
+                const LatencyStats ls = LatencyStats::from(lat);
+                std::cout << "    " << std::setw(15) << std::left << to_string(mode)
+                          << std::right << nr << " readers : "
+                          << std::setw(4) << lat.size() << "/" << kInserts << " inserts"
+                          << "   total " << std::setw(9) << total << " ms"
+                          << "   p50 " << std::setw(8) << ls.p50
+                          << "   p99 " << std::setw(9) << ls.p99
+                          << (gave_up ? "   <-- GAVE UP: writer starved" : "") << "\n";
+
+                json::Object p;
+                p.str("kind", "writer_starvation")
+                 .str("lock_mode", to_string(mode))
+                 .num("readers", static_cast<long long>(nr))
+                 .num("inserts_attempted", static_cast<long long>(kInserts));
+                json::Object m;
+                m.num("inserts_completed", static_cast<long long>(lat.size()))
+                 .num("total_ms", total)
+                 .num("insert_p50_ms", ls.p50).num("insert_p99_ms", ls.p99)
+                 .num("insert_max_ms", ls.max)
+                 .boolean("starved", gave_up)
+                 .raw("recall_at_k", "null");
+                write_record(m, p);
+            }
+        }
+        std::cout << "\n  peak RSS   : " << peak_rss_mib() << " MiB\n";
     }
 
     // ---- optional D5 layout A/B -------------------------------------------

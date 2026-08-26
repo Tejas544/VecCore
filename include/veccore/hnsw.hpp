@@ -57,6 +57,30 @@ struct HnswParams {
     [[nodiscard]] double mL() const noexcept;
 };
 
+/// Per-thread scratch space for a search.
+///
+/// This exists because of a race that Phase 2 shipped and Phase 5 exposed
+/// (B-10). `search` needs a visited set and a distance counter. Holding them as
+/// members of the index looks harmless single-threaded, and it is -- but under a
+/// `shared_mutex` **multiple readers run concurrently by design**, and a shared
+/// lock grants shared ownership of the index, not permission to write to it.
+/// Two concurrent searches would corrupt each other's visited stamps and race
+/// on the counter.
+///
+/// The counter matters separately. Making it a `std::atomic` would have been the
+/// obvious fix and a bad one: it is incremented once per distance computation --
+/// thousands of times per query -- so it would put an atomic RMW in the hottest
+/// loop in the project AND put every thread's increments on the same cache line.
+/// That is textbook false sharing, and it would have shown up as "concurrency
+/// does not scale" with the lock taking the blame. Per-thread state has neither
+/// problem.
+struct SearchScratch {
+    VisitedList visited;
+    std::size_t distance_calls = 0;
+
+    void reset_counters() noexcept { distance_calls = 0; }
+};
+
 struct HnswStats {
     std::size_t nodes = 0;
     std::size_t max_level = 0;
@@ -79,9 +103,27 @@ public:
     /// Algorithm 5. `ef_search` is clamped up to k (P-17): with ef < k the
     /// result set physically cannot hold k items, and returning fewer reads as
     /// catastrophic recall.
+    ///
+    /// **This overload is the thread-safe one.** `scratch` must be owned by the
+    /// calling thread and never shared.
+    [[nodiscard]] std::vector<Neighbor> search(const float* query,
+                                               std::size_t k,
+                                               std::size_t ef_search,
+                                               SearchScratch& scratch) const;
+
+    /// Convenience overload for single-threaded callers, using an internal
+    /// scratch buffer.
+    ///
+    /// **NOT safe to call concurrently**, even though it is `const` and even
+    /// under a shared lock -- it writes to a member. Concurrent callers must use
+    /// the scratch overload above. `const` describes the logical operation, not
+    /// the absence of writes (B-10).
     [[nodiscard]] std::vector<Neighbor> search(const float* query,
                                                std::size_t k,
                                                std::size_t ef_search) const;
+
+    /// A scratch buffer correctly sized for this index.
+    [[nodiscard]] SearchScratch make_scratch() const;
 
     [[nodiscard]] HnswStats stats() const;
 
@@ -96,8 +138,11 @@ public:
     [[nodiscard]] std::string check_invariants() const;
 
     [[nodiscard]] const HnswParams& params() const noexcept { return params_; }
-    [[nodiscard]] std::size_t distance_calls() const noexcept { return distance_calls_; }
-    void reset_distance_calls() const noexcept { distance_calls_ = 0; }
+    /// Distance calls made through the *internal* scratch only -- i.e. by
+    /// insert() and by the single-threaded search overload. Concurrent callers
+    /// read their own `SearchScratch::distance_calls`.
+    [[nodiscard]] std::size_t distance_calls() const noexcept { return scratch_.distance_calls; }
+    void reset_distance_calls() const noexcept { scratch_.distance_calls = 0; }
 
 private:
     /// Algorithm 2. Returns the ef closest nodes found on `layer`, as a
@@ -105,13 +150,15 @@ private:
     using ResultHeap = std::priority_queue<Neighbor, std::vector<Neighbor>, WorseFirst>;
     using CandidateHeap = std::priority_queue<Neighbor, std::vector<Neighbor>, CloserFirst>;
 
-    ResultHeap search_layer(const float* query, vec_id_t entry, std::size_t ef, std::size_t layer) const;
+    ResultHeap search_layer(const float* query, vec_id_t entry, std::size_t ef,
+                            std::size_t layer, SearchScratch& scratch) const;
 
     /// Algorithm 4. Consumes `candidates`, returns at most `m` chosen ids.
     void select_neighbors_heuristic(const float* base_vec,
                                     CandidateHeap& candidates,
                                     std::size_t m,
-                                    std::vector<vec_id_t>& out) const;
+                                    std::vector<vec_id_t>& out,
+                                    SearchScratch& scratch) const;
 
     [[nodiscard]] std::size_t random_level();
 
@@ -146,8 +193,8 @@ private:
 
     void set_links(vec_id_t id, std::size_t layer, const std::vector<vec_id_t>& ids);
 
-    [[nodiscard]] float dist(const float* a, const float* b) const noexcept {
-        ++distance_calls_;
+    [[nodiscard]] float dist(const float* a, const float* b, SearchScratch& scratch) const noexcept {
+        ++scratch.distance_calls;
         return metric_(a, b, store_.dim());
     }
 
@@ -168,8 +215,9 @@ private:
     bool empty_ = true;
 
     std::mt19937_64 rng_;
-    mutable VisitedList visited_;
-    mutable std::size_t distance_calls_ = 0;
+    /// Used by insert() (single writer, exclusive by construction) and by the
+    /// single-threaded search overload. Never touched by the scratch overload.
+    mutable SearchScratch scratch_;
 };
 
 }  // namespace veccore

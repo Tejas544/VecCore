@@ -28,7 +28,7 @@ HnswIndex::HnswIndex(const VectorStore& store, HnswParams params)
     links0_.assign(n * stride0_, 0);
     upper_offset_.assign(n, 0);
     levels_.assign(n, 0);
-    visited_.resize(n);
+    scratch_.visited.resize(n);
 }
 
 std::size_t HnswIndex::random_level() {
@@ -52,17 +52,24 @@ void HnswIndex::set_links(vec_id_t id, std::size_t layer, const std::vector<vec_
     for (std::size_t i = 0; i < n; ++i) l[i + 1] = ids[i];
 }
 
+SearchScratch HnswIndex::make_scratch() const {
+    SearchScratch s;
+    s.visited.resize(store_.size());
+    return s;
+}
+
 HnswIndex::ResultHeap HnswIndex::search_layer(const float* query,
                                               vec_id_t entry,
                                               std::size_t ef,
-                                              std::size_t layer) const {
-    visited_.reset();
+                                              std::size_t layer,
+                                              SearchScratch& scratch) const {
+    scratch.visited.reset();
 
     ResultHeap W;       // top() = FARTHEST kept result; the eviction candidate
     CandidateHeap C;    // top() = CLOSEST unexplored candidate
 
-    const float d_entry = dist(query, store_.at(entry));
-    (void)visited_.test_and_set(entry);
+    const float d_entry = dist(query, store_.at(entry), scratch);
+    (void)scratch.visited.test_and_set(entry);
     W.push({d_entry, entry});
     C.push({d_entry, entry});
 
@@ -78,9 +85,9 @@ HnswIndex::ResultHeap HnswIndex::search_layer(const float* query,
         const std::uint32_t degree = l[0];
         for (std::uint32_t i = 1; i <= degree; ++i) {
             const auto e = static_cast<vec_id_t>(l[i]);
-            if (!visited_.test_and_set(e)) continue;
+            if (!scratch.visited.test_and_set(e)) continue;
 
-            const float d_e = dist(query, store_.at(e));
+            const float d_e = dist(query, store_.at(e), scratch);
             if (W.size() < ef || d_e < W.top().dist) {
                 C.push({d_e, e});
                 W.push({d_e, e});
@@ -94,7 +101,8 @@ HnswIndex::ResultHeap HnswIndex::search_layer(const float* query,
 void HnswIndex::select_neighbors_heuristic(const float* base_vec,
                                            CandidateHeap& candidates,
                                            std::size_t m,
-                                           std::vector<vec_id_t>& out) const {
+                                           std::vector<vec_id_t>& out,
+                                           SearchScratch& scratch) const {
     out.clear();
 
     // Algorithm 4, and P-05 is the whole reason this function is not three
@@ -124,7 +132,7 @@ void HnswIndex::select_neighbors_heuristic(const float* base_vec,
             for (std::uint32_t i = 1; i <= l[0]; ++i) {
                 const auto e = static_cast<vec_id_t>(l[i]);
                 if (present.insert(e).second) {
-                    candidates.push({dist(base_vec, store_.at(e)), e});
+                    candidates.push({dist(base_vec, store_.at(e), scratch), e});
                 }
             }
         }
@@ -138,7 +146,7 @@ void HnswIndex::select_neighbors_heuristic(const float* base_vec,
         bool keep = true;
         for (const vec_id_t r : out) {
             // Closer to an already-kept neighbour than to us => redundant.
-            if (dist(store_.at(e.id), store_.at(r)) < e.dist) { keep = false; break; }
+            if (dist(store_.at(e.id), store_.at(r), scratch) < e.dist) { keep = false; break; }
         }
         if (keep) out.push_back(e.id);
         else if (params_.keep_pruned) discarded.push_back(e);
@@ -174,7 +182,7 @@ void HnswIndex::insert(vec_id_t id) {
     // Phase 1: greedy descent through layers above ours, ef = 1. This is the
     // motorway: cross the space cheaply before doing detailed work.
     for (std::size_t lc = max_level_; lc > level; --lc) {
-        ResultHeap w = search_layer(q, ep, 1, lc);
+        ResultHeap w = search_layer(q, ep, 1, lc, scratch_);
         ep = w.top().id;
     }
 
@@ -182,7 +190,7 @@ void HnswIndex::insert(vec_id_t id) {
     std::vector<vec_id_t> chosen;
     const std::size_t start = std::min(level, max_level_);
     for (std::size_t lc = start + 1; lc-- > 0;) {
-        ResultHeap w = search_layer(q, ep, params_.ef_construction, lc);
+        ResultHeap w = search_layer(q, ep, params_.ef_construction, lc, scratch_);
 
         CandidateHeap cands;
         {
@@ -197,7 +205,7 @@ void HnswIndex::insert(vec_id_t id) {
         ep = cands.top().id;
 
         const std::size_t m_target = (lc == 0) ? params_.m_max0() : params_.M;
-        select_neighbors_heuristic(q, cands, params_.M, chosen);
+        select_neighbors_heuristic(q, cands, params_.M, chosen, scratch_);
         set_links(id, lc, chosen);
 
         // Bidirectional linking, then the shrink that P-06 says gets skipped.
@@ -218,12 +226,12 @@ void HnswIndex::insert(vec_id_t id) {
             const float* nb_vec = store_.at(nb);
             for (std::uint32_t i = 1; i <= deg; ++i) {
                 const auto e = static_cast<vec_id_t>(nl[i]);
-                nb_cands.push({dist(nb_vec, store_.at(e)), e});
+                nb_cands.push({dist(nb_vec, store_.at(e), scratch_), e});
             }
-            nb_cands.push({dist(nb_vec, q), id});
+            nb_cands.push({dist(nb_vec, q, scratch_), id});
 
             std::vector<vec_id_t> reselected;
-            select_neighbors_heuristic(nb_vec, nb_cands, m_target, reselected);
+            select_neighbors_heuristic(nb_vec, nb_cands, m_target, reselected, scratch_);
             set_links(nb, lc, reselected);
         }
     }
@@ -244,16 +252,23 @@ void HnswIndex::build() {
 std::vector<Neighbor> HnswIndex::search(const float* query,
                                         std::size_t k,
                                         std::size_t ef_search) const {
+    return search(query, k, ef_search, scratch_);
+}
+
+std::vector<Neighbor> HnswIndex::search(const float* query,
+                                        std::size_t k,
+                                        std::size_t ef_search,
+                                        SearchScratch& scratch) const {
     if (empty_) return {};
     const std::size_t ef = std::max(ef_search, k);  // P-17
 
     vec_id_t ep = entry_point_;
     for (std::size_t lc = max_level_; lc > 0; --lc) {
-        ResultHeap w = search_layer(query, ep, 1, lc);
+        ResultHeap w = search_layer(query, ep, 1, lc, scratch);
         ep = w.top().id;
     }
 
-    ResultHeap w = search_layer(query, ep, ef, 0);
+    ResultHeap w = search_layer(query, ep, ef, 0, scratch);
     std::vector<Neighbor> out;
     out.reserve(w.size());
     while (!w.empty()) { out.push_back(w.top()); w.pop(); }
@@ -278,7 +293,7 @@ HnswStats HnswIndex::stats() const {
 offset_t HnswIndex::graph_bytes() const noexcept {
     return links0_.size() * sizeof(std::uint32_t) + upper_.size() * sizeof(std::uint32_t) +
            upper_offset_.size() * sizeof(offset_t) + levels_.size() * sizeof(std::uint8_t) +
-           visited_.bytes();
+           scratch_.visited.bytes();
 }
 
 std::string HnswIndex::check_invariants() const {
