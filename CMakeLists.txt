@@ -149,6 +149,22 @@ endif()
 add_executable(hybrid_eval tools/hybrid_eval.cpp)
 target_link_libraries(hybrid_eval PRIVATE veccore)
 
+# ---------------------------------------------------------------------------
+# Python bindings. Optional: the library must build and test without them, so a
+# missing pybind11 is a skipped target and not a broken build.
+# ---------------------------------------------------------------------------
+option(VECCORE_BUILD_PYTHON "Build the pybind11 module" ON)
+if(VECCORE_BUILD_PYTHON)
+  find_package(pybind11 CONFIG QUIET)
+  if(pybind11_FOUND)
+    pybind11_add_module(_veccore bindings/veccore_py.cpp)
+    target_link_libraries(_veccore PRIVATE veccore)
+    message(STATUS "  python     : pybind11 ${pybind11_VERSION} -> _veccore")
+  else()
+    message(STATUS "  python     : pybind11 not found, skipping _veccore")
+  endif()
+endif()
+
 if(VECCORE_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
