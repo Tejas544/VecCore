@@ -90,6 +90,7 @@ void usage() {
         "  --pq-n-init N       k-means restarts, lowest inertia kept (default: 3)\n"
         "  --pq-rerank A,B     exact-rescore shortlist sizes; 0 = ADC only (default: 0,100)\n"
         "  --threads A,B,C     thread counts for --index threads (default: 1,2,4,6,8,12)\n"
+        "  --persist-path P    --index persist: where to write the .vci file\n"
         "  --layout-ab         also run the D5 flat-vs-pointer-chasing comparison\n"
         "  --allow-untrusted   write a record from a Debug/sanitized/dirty build\n";
 }
@@ -133,6 +134,7 @@ Args parse(int argc, char** argv) {
         else if (arg == "--pq-n-init")       a.pq_n_init = std::stoul(next("a number"));
         else if (arg == "--pq-rerank")       a.pq_rerank = parse_list(next("a list"));
         else if (arg == "--threads")         a.threads = parse_list(next("a list"));
+        else if (arg == "--persist-path")    a.persist_path = next("a path");
         else if (arg == "--layout-ab")       a.layout_ab = true;
         else if (arg == "--allow-untrusted") a.allow_untrusted = true;
         else if (arg == "-h" || arg == "--help") a.help = true;
