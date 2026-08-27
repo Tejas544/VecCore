@@ -3,12 +3,17 @@
 **An HNSW vector index with Product-Quantization compression and hybrid dense+sparse retrieval,
 written from scratch in C++17 and benchmarked against FAISS.**
 
+[![CI](https://github.com/Tejas544/VecCore/actions/workflows/ci.yml/badge.svg)](https://github.com/Tejas544/VecCore/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 > **Status: complete.** All six phases shipped and gated. HNSW, Product Quantization, BM25+RRF
 > and concurrent search, benchmarked head-to-head against FAISS on identical data with matched
 > parameters and matched thread counts.
-> This README is deliberately empty of numbers. Every claim below the line will arrive with a JSON
-> record in [`results/`](results/) and the git SHA that produced it — see `CONTEXT.md` D10. If you
-> are reading this and a number has no record behind it, that is a bug in the README.
+> Every number below traces to a JSON record in [`results/`](results/) carrying the git SHA, CPU,
+> compiler, flags, thread count and RNG seed that produced it — see `CONTEXT.md` D10. All 88 records
+> are stamped `trusted: true` from a clean tree and a Release build. If you find a number here with
+> no record behind it, that is a bug in the README, and B-12 is the entry about the last time it
+> happened.
 
 New to vector search? **[`WHAT_IS_THIS.md`](WHAT_IS_THIS.md)** explains the whole problem from zero
 background — what a vector is, why brute force fails, and what HNSW and PQ actually do.
@@ -106,11 +111,122 @@ ctest --test-dir ~/veccore-build --output-on-failure
 runs several times slower than Release, and a latency copied out of one is indistinguishable from a
 real regression once it reaches a plot.
 
+## Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs four jobs on every push: the Release
+build with **80 doctest cases and 33 Python tests**, the ASan+UBSan build, the TSan build, and a
+`pip install .` that imports the package from outside the source tree.
+
+**Two of those jobs assert that a binary fails.** `asan_probe` must abort and `tsan_probe` must
+print a race report; if either one succeeds quietly, CI fails. That inversion is the whole point —
+a clean sanitizer run proves nothing unless the sanitizer can be shown to fire, which is L-01's
+lesson and the reason this repo has probes at all. A green check here means the detectors are real,
+not merely that nothing was detected.
+
+**No benchmarks run in CI, deliberately.** SIFT1M is a 168 MB download and a 19-minute
+single-threaded build, and a latency measured on a shared runner with unknown neighbours would
+violate `CONTEXT.md` D10 in the one place that rule matters most. Correctness is portable;
+performance is not.
+
 ---
 
 ## Architecture
 
-*Diagram arrives at Phase 6. Placeholder rather than a lie: nothing but the rails exists yet.*
+```mermaid
+flowchart TB
+    subgraph data["data — gitignored, lives on ext4"]
+        SIFT["SIFT1M + SIFT10K fixture<br/>.fvecs / .ivecs"]
+        EDG["EdgeRAG corpus<br/>362 docs, 650 queries"]
+    end
+
+    subgraph lib["libveccore.a — no Python, no network, no I/O framework"]
+        direction TB
+        XV["xvecs reader<br/>P-01"]
+        VS["VectorStore<br/>one flat float buffer, row-major, stride d"]
+        DIST["distance.hpp<br/>L2Sqr, NegInnerProduct — functors, AVX2+FMA"]
+        VIS["VisitedList<br/>epoch-stamped, never cleared"]
+        LOCK["concurrent.hpp<br/>writer-priority turnstile, B-11"]
+        RRF["fusion.hpp<br/>RRF, k=60"]
+        STAMP["stamp.cpp + json.hpp<br/>provenance writer"]
+        subgraph idx["indexes"]
+            direction LR
+            FLAT["FlatIndex<br/>exact — the ground truth"]
+            HNSW["HnswIndex<br/>flat adjacency, stride M_max+1"]
+            PQ["PQ + ADC<br/>k-means++ codebooks"]
+            BM["Bm25Index<br/>inverted index"]
+        end
+    end
+
+    subgraph cons["consumers — each depends on the library, never the reverse"]
+        direction LR
+        BENCH["bench<br/>p50/p95/p99, 5+ trials"]
+        TESTS["veccore_tests<br/>80 doctest cases"]
+        PROBE["asan_probe, tsan_probe<br/>prove the sanitizer fires"]
+        HYB["hybrid_eval<br/>BM25 vs TF-IDF"]
+        PYB["_veccore<br/>pybind11, GIL released"]
+    end
+
+    subgraph out["evidence"]
+        direction LR
+        JSONL["results/bench.jsonl<br/>88 records: git SHA, CPU, flags, seed"]
+        PLOTS["docs/plots<br/>regenerated, never hand-typed"]
+    end
+
+    PYPKG["python/veccore<br/>VecCoreIndex implements EdgeRAG RetrievalIndex"]
+    FAISS["bench/faiss_baseline.py<br/>FAISS — the benchmark, never a dependency"]
+
+    SIFT --> XV
+    XV --> VS
+    EDG --> BM
+    EDG --> HYB
+    VS --> FLAT
+    VS --> HNSW
+    VS --> PQ
+    DIST -.-> FLAT
+    DIST -.-> HNSW
+    DIST -.-> PQ
+    VIS -.-> HNSW
+    LOCK -.-> HNSW
+    BM --> RRF
+    HNSW --> RRF
+    idx --> BENCH
+    idx --> TESTS
+    idx --> PYB
+    idx --> PROBE
+    RRF --> HYB
+    STAMP -.-> BENCH
+    BENCH --> JSONL
+    HYB --> JSONL
+    FAISS -.->|"interleaved A/B/A/B, same machine and session"| JSONL
+    JSONL --> PLOTS
+    PYB --> PYPKG
+
+    classDef libnode fill:#1f6feb22,stroke:#1f6feb
+    classDef evid fill:#2da44e22,stroke:#2da44e
+    classDef ext fill:#8250df22,stroke:#8250df
+    class XV,VS,DIST,FLAT,HNSW,PQ,BM,VIS,LOCK,RRF,STAMP libnode
+    class JSONL,PLOTS evid
+    class FAISS,PYPKG,EDG ext
+```
+
+**Two properties of this graph are the design, and both are worth defending in an interview.**
+
+**The arrows into `libveccore.a` all point one way.** The library links `Threads` and nothing else —
+no pybind11, no numpy, no HTTP, and emphatically no FAISS. `_veccore`, `bench`, the tests and the
+probes are separate CMake targets that depend on it; none of it depends on them. That is why the
+same code is a library, a benchmark, a test subject and a Python extension without a single
+`#ifdef`, and it is why `pip install faiss-cpu` failing could never break a build of the thing being
+measured.
+
+**The evidence path is a pipeline, not a habit.** `bench` stamps provenance into every record,
+`plots.py` reads only records, and the README reads only plots. No number in this file was typed by
+a human, which is the property that makes B-12 — an unmeasured number that reached the limitations
+section — a *bug with an entry* rather than an ordinary bit of prose.
+
+*(One honest caveat on the boundary: `PLAN.md` §3 says the library "knows nothing about pybind11,
+JSON, or FastAPI." Two of those three are exactly true. The library does carry a small JSON
+**writer** in `json.hpp`/`stamp.cpp`, because provenance stamping is a property of the measurement,
+not of the harness — the diagram shows it inside the library because that is where it is.)*
 
 ## Benchmarks
 
@@ -155,19 +271,31 @@ ratios matching 1/M to three decimal places is the evidence that it is right.
 This is the table the project exists to be able to show. `02_VECCORE.md` set the bar at
 *"within 2–3× of FAISS is a good solo result."*
 
-| ef_search | VecCore recall@10 | FAISS recall@10 | VecCore QPS | FAISS QPS | FAISS faster by |
-|---|---|---|---|---|---|
-| 10 | 0.7244 | 0.7044 | 8,033 | 14,001 | 1.74× |
-| 40 | 0.9290 | 0.9288 | 3,288 | 5,739 | 1.75× |
-| **80** | **0.9755** | 0.9770 | **1,934** | 3,216 | **1.66×** |
-| 160 | 0.9935 | 0.9946 | 1,079 | 1,778 | 1.65× |
-| 320 | 0.9987 | 0.9987 | 595 | 956 | 1.61× |
-| **build** | | | **1,139 s** | **753 s** | **1.51×** |
+| ef_search | VecCore recall@10 | FAISS recall@10 | VecCore QPS | FAISS QPS | VecCore p99 ms | FAISS p99 ms | FAISS faster by |
+|---|---|---|---|---|---|---|---|
+| 10 | 0.7244 | 0.7044 | 8,033 | 14,001 | 0.256 | 0.183 | 1.74x |
+| 20 | 0.8409 | 0.8357 | 5,397 | 9,023 | 0.330 | 0.247 | 1.67x |
+| 40 | 0.9290 | 0.9288 | 3,288 | 5,739 | 0.550 | 0.355 | 1.75x |
+| 80 | 0.9755 | 0.9770 | 1,934 | 3,216 | 0.832 | 0.567 | 1.66x |
+| 160 | 0.9935 | 0.9946 | 1,079 | 1,778 | 1.513 | 1.079 | 1.65x |
+| 320 | 0.9987 | 0.9987 | 595 | 956 | 2.791 | 2.221 | 1.61x |
+| **build** | | | | | | | **1,139 s vs 753 s = 1.51x** |
+
+*Generated by `bench/plots.py` into `docs/plots/head_to_head.md` and pasted whole. It is built by
+pairing records on `ef_search`, so a row appears only when both sides were measured at the same
+parameters in the same interleaved session — which is also how the `ef=20` row and the p99 columns
+came back after an earlier hand-assembled version of this table quietly dropped them.*
 
 **Recall matches to within 0.002 at every point on the curve** — slightly ahead at low `ef_search`,
 slightly behind at high. That is the correctness result: this HNSW builds a graph of equivalent
 quality to the reference implementation. Throughput is **1.6–1.75× behind**, inside the spec's
 target band, and build time is 1.51× behind.
+
+**The p99 columns are the more interesting half, and they are kinder than the throughput ratio.**
+At the headline ef=80 point FAISS's p99 is 0.567 ms against our 0.832 ms — **1.47×**, against a
+1.66× gap on QPS. The tail is where a serving system actually lives, so the number that matters most
+is the one where the gap is narrowest. Both sides widen at ef=320 (2.221 vs 2.791 ms) because the
+beam search does more work per query and the variance grows with it.
 
 `faiss.omp_set_num_threads(1)` is set explicitly (P-32) — FAISS defaults to every core, and
 comparing that against a single-threaded search would be a 6× error in its favour and the first
@@ -338,8 +466,11 @@ prefetcher can predict. The first version of this benchmark reported the naive l
 
 ![latency](docs/plots/latency_percentiles.png)
 
-The FAISS head-to-head arrives in Phase 6, measured in the same session on the same machine with
-matched thread counts, interleaved A/B/A/B.
+Latency percentiles across the `ef_search` sweep, which is the reason `bench` times **per query**
+rather than amortising a batch: at ef=80 the p99 is 0.83 ms against a 0.53 ms p50, and you cannot
+recover that ratio from a mean. FAISS's p99 at the same point is 0.567 ms — measured in the same
+interleaved session as the head-to-head table above, and 1.47× ahead, which is a slightly narrower
+gap than the 1.66× it holds on throughput.
 
 ### Integrating with EdgeRAG — three claims that survive a follow-up question
 
@@ -374,6 +505,15 @@ retrieval slower for the sake of a nicer architecture diagram.
 
 ## Using it from Python
 
+```bash
+pip install .
+```
+
+That builds the extension through the same `CMakeLists.txt` the benchmarks use — scikit-build-core
+drives the real CMake project rather than a second description of it that drifts. The one flag that
+differs is `-march=native`, which is **off** for wheels: right for a benchmark on the machine that
+runs it, and a `SIGILL` at import time on the first machine with a narrower ISA.
+
 ```python
 import veccore
 
@@ -381,9 +521,47 @@ index = veccore.HnswIndex(vectors, M=16, ef_construction=200)   # (n, dim) float
 ids, distances = index.search(query, k=10, ef_search=64)        # squared L2
 ```
 
-The GIL is released around every search (P-35), so threading through the binding actually overlaps:
-**4 threads take 1.35× the single-threaded time for 4× the work**. A held GIL would show 4.0×, and
-nothing in the C++ benchmark would have noticed — which is why `tests/test_bindings.py` exists.
+**Incremental insert, which is Phase 5's work finally reachable from the language that consumes it:**
+
+```python
+new_id = index.add(vector)            # one vector, returns its id
+ids    = index.add_batch(vectors)     # (n, dim) under ONE lock acquisition
+```
+
+`add` is safe to call while other threads are searching, and that is a stronger claim than it looks.
+Appending to the vector store can **reallocate** it, and every concurrent reader is at that moment
+holding `const float*` pointers into the old buffer — so the append and the graph insert happen
+inside one exclusive section rather than as two steps a caller could interleave. A reallocation
+under a live reader is a use-after-free that does not crash; it returns k plausible, wrong
+neighbours. `include/veccore/concurrent.hpp` carries the full argument.
+
+Prefer `add_batch` for more than one vector. Under the default `writer_priority` lock mode every
+acquisition stalls all readers at the turnstile, so N separate `add` calls are N stalls.
+
+**Product Quantization**, with the three memory numbers kept deliberately separate:
+
+```python
+pq = veccore.PqIndex(vectors, m=8)              # trains codebooks, then encodes
+ids, d = pq.search(query, k=10)                 # ADC scan
+ids, d = pq.search_rerank(query, k=10, candidates=200)   # ADC, then exact rescoring
+
+pq.compression_ratio   # 64.0 at m=8 on 128-dim -- codes only
+pq.code_bytes          # the compressed footprint
+pq.codebook_bytes      # the fixed cost of the codebooks
+pq.vector_bytes        # the full vectors, which search_rerank needs resident
+```
+
+Those four are never summed for you. `search_rerank` reaches the good recall numbers **only with the
+uncompressed vectors in RAM**, so quoting 64× compression for a reranking configuration would be
+exactly the overclaim `WHAT_IS_THIS.md` §10 criticises other people for. The API makes you do that
+arithmetic on purpose.
+
+The GIL is released around every search, every `add`, and PQ training (P-35), so threading through
+the binding actually overlaps: **4 threads take 1.35× the single-threaded time for 4× the work**. A
+held GIL would show 4.0×, and nothing in the C++ benchmark would have noticed — which is why
+`tests/test_bindings.py` exists. Getting that measurement *wrong* is easy in the other direction
+too, and [`BUGS.md`](BUGS.md) B-14 is the entry about a GIL test that was really measuring the
+binding's own marshalling cost.
 
 ## Design decisions
 
@@ -398,6 +576,14 @@ the end is a limitations section that flatters:
 
 - **No deletes.** Tombstones + periodic rebuild is the design; removing a node in place severs the
   links that pass *through* it and quietly damages navigability for every other query.
+- **No persistence — no `save` / `load`, in C++ or Python.** An index exists only for the lifetime
+  of the process that built it, so every restart is a full rebuild: **1,139 s for SIFT1M.** This is
+  the largest functional gap in the repo and it got sharper, not smaller, when `add` shipped — an
+  index you can grow incrementally but cannot write to disk is one you have to grow again from
+  scratch every morning. The design is not subtle (the graph is already three flat arrays plus a
+  header, so it serialises almost directly); the reason it is absent is time, and the reason it is
+  named here rather than in a roadmap is that a limitations section which omits the biggest one is
+  advertising.
 - **Single node, memory resident.** 1M vectors fit in RAM. Nothing here addresses what changes at
   1B — sharding, disk-based indexes, DiskANN.
 - **No filtered search.** "Nearest neighbours, but only documents from 2024" has no clean answer in
@@ -407,10 +593,15 @@ the end is a limitations section that flatters:
 - **Approximate with no bound.** Recall is measured on a test set. Nothing guarantees it holds on
   data that drifts.
 - **Concurrent *insert* is coarse-grained.** One lock for the whole index, so inserts serialise
-  against each other and against all readers. The finer design — per-node link locks plus an atomic
-  entry point — is described in `concurrent.hpp` with its specific hazard, and was not built: a
-  subtle race in a graph mutation path produces a corrupted index that still returns k results, and
-  no assertion in this repo would catch it.
+  against each other and against all readers. It is correct, it is measured, and it is reachable
+  from Python via `add` / `add_batch` — but a write-heavy workload will not scale, and the honest
+  framing is that this is a many-readers-occasional-writer design rather than a general one. The
+  finer alternative — per-node link locks plus an atomic entry point — is described in
+  `concurrent.hpp` with its specific hazard, and was not built: a subtle race in a graph mutation
+  path produces a corrupted index that still returns k results, and no assertion in this repo would
+  catch it. `BUGS.md` B-13 is the entry about how a *safe* accessor became a race the moment the
+  index could grow, which is the cheapest available argument for not hand-rolling the finer design
+  under time pressure.
 - **Read scaling tops out around 4.2× on 6 cores** at a memory-resident working set. Memory
   bandwidth, not the lock — measured, see above.
 - **The spec's "+3–10% hybrid recall lift" target is not achievable on the available data.**
@@ -427,7 +618,39 @@ the end is a limitations section that flatters:
   `select_neighbors_heuristic` is O(M²) distance calls per insert with no reuse. *(An earlier draft
   of this line claimed FAISS was ~10× faster here, generalising from the PQ result. It was wrong and
   it was in the limitations section, which is the worst place in the repo to guess — B-12.)*
-- Plus whatever `PLAN.md` §0.3's cut order takes, which will be listed here by name.
+
+**Cut from scope, by name.** `PLAN.md` §0.3 fixed the cut order on Aug 21, *before* the schedule
+pressure arrived, so that nothing would be dropped at 2 a.m. on the basis of what was going badly.
+Four of the seven were taken. Each is listed with what its absence actually costs, because a cut
+list without consequences is a cut list that is hiding something:
+
+- **Cross-encoder reranking** (cut 1). The spec's own first cut, and the right one — it is a
+  pretrained model you call, so it demonstrates nothing I own. **Cost:** `02_VECCORE.md` §6's
+  *"rerank recall lift, with latency cost"* is the one required metric in that table with no number
+  against it. Note this is a *different thing* from the PQ exact-rerank measured above, which is
+  mine and is reported.
+- **gRPC** (cut 2) and **the FastAPI service** (cut 4). Cut 4 goes one item further than the spec,
+  which kept the service. The reasoning: the **pybind11 module is what a caller actually calls**, and
+  it is the artifact that proves the C++/Python seam works. An HTTP wrapper on top adds one
+  interview answer — "what does the network layer cost?" — that can be given from a whiteboard.
+  **Cost:** `02_VECCORE.md` §9's *"pybind11 bindings + FastAPI service"* is half-delivered, and
+  there is no serving-layer latency number anywhere in this repo.
+- **IVF on top of PQ** (cut 3). Plain PQ + ADC shipped instead. IVF is a coarse quantizer plus
+  inverted lists — roughly an hour — but it only starts to matter at a scale nothing here is
+  measured at. **Cost:** the spec's target CV bullet says *"IVF-PQ"*; what exists is PQ, and the
+  bullet below has been written to say PQ. Every "1M vectors" caveat in this list is the same
+  caveat.
+- **Hand-written AVX2 intrinsics** (cut 5) — cut, then **closed by measurement rather than left as
+  an assumption**. Both distance kernels already compile to AVX2+FMA with `-fopt-info-vec-missed`
+  reporting nothing, and forcing `-mprefer-vector-width=512` on this AVX-512-capable CPU changes
+  throughput by 1.2% against 13–43% run-to-run spread, because the loop is bandwidth-bound rather
+  than ALU-bound. Full workings in `CONTEXT.md` D11. **Cost:** none that is measurable, which is the
+  finding.
+- **PQ codebooks on a 100k subsample** (cut 6) — taken, standard practice, and stated with the
+  sample size above.
+- **Concurrent insert** (cut 7) was the designated last resort and **was not cut.** It shipped, and
+  it is the reason B-11 exists: a read-only scaling curve would never have exposed the writer
+  starvation, so the most valuable bug in this repo is a direct dividend of not taking the last cut.
 
 ## The CV bullet, with the blanks filled from `results/`
 

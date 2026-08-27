@@ -1,0 +1,72 @@
+[build-system]
+# scikit-build-core drives the existing CMakeLists.txt rather than duplicating it.
+#
+# The alternative was a setuptools `build_ext` that shells out to CMake, which
+# means two descriptions of the same build that drift apart the first time a flag
+# changes. This backend calls the real CMake project, so `pip install .` and
+# `cmake --build` compile the same code with the same options -- which matters
+# here more than usual, because `CONTEXT.md` D10 makes the build flags part of
+# what a published number means.
+requires = ["scikit-build-core>=0.9", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "veccore"
+version = "0.1.0"
+description = "An HNSW vector index with Product-Quantization compression and hybrid dense+sparse retrieval, written from scratch in C++17."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Tejas544", email = "tejas2332rajput@gmail.com" }]
+keywords = ["hnsw", "vector-search", "ann", "product-quantization", "bm25", "cpp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# numpy is a genuine runtime dependency: every array crossing the binding is a
+# py::array_t. FAISS is deliberately absent -- it is the benchmark, never a
+# dependency (02_VECCORE.md section 2), and it is imported only by
+# bench/faiss_baseline.py.
+dependencies = ["numpy>=1.21"]
+
+[project.optional-dependencies]
+bench = ["matplotlib>=3.5", "faiss-cpu>=1.7"]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/Tejas544/VecCore"
+Repository = "https://github.com/Tejas544/VecCore"
+
+[tool.scikit-build]
+# The pure-Python half lives in python/veccore; the extension is built by CMake
+# and installed alongside it.
+wheel.packages = ["python/veccore"]
+cmake.version = ">=3.20"
+cmake.build-type = "Release"
+build-dir = "build/{wheel_tag}"
+
+[tool.scikit-build.cmake.define]
+# A wheel builds the extension and nothing else. Tests, bench and the sanitizer
+# probes are developer targets and pull in doctest via FetchContent, which would
+# make `pip install .` reach for the network for no reason.
+VECCORE_BUILD_TESTS = "OFF"
+VECCORE_BUILD_BENCH = "OFF"
+VECCORE_BUILD_TOOLS = "OFF"
+# -march=native is right for a benchmark on the machine that runs it and wrong
+# for a wheel, which may be built on one machine and imported on another: the
+# first unsupported instruction is a SIGILL at import time. CONTEXT.md D10's
+# environment rule is about *published numbers*, and a wheel does not publish
+# any -- so the portable build is the correct default here, and anyone measuring
+# should use the CMake path the README documents.
+VECCORE_NATIVE = "OFF"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# tests/ holds both C++ sources and Python tests; only the latter are pytest's.
+python_files = ["test_*.py"]

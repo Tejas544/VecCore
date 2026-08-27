@@ -98,7 +98,28 @@ public:
     void build();
 
     /// Insert one vector that is already in the store.
+    ///
+    /// `id` may be **past** the size the index was constructed at: the per-node
+    /// arrays grow to cover it (see `grow_to`). That is what makes an index
+    /// built on n vectors able to accept the (n+1)th without a rebuild, which
+    /// is the incremental-insert requirement in `PLAN.md` §5.4.
     void insert(vec_id_t id);
+
+    /// Grow the per-node arrays so ids in [0, n) are addressable.
+    ///
+    /// Called by `insert` and safe to call directly before a batch of inserts,
+    /// which avoids the repeated reallocation of `links0_` that growing one node
+    /// at a time would cause. Never shrinks.
+    ///
+    /// **This is a writer operation.** It reallocates buffers that concurrent
+    /// readers hold no lock against, so callers going through `ConcurrentHnsw`
+    /// get the exclusive lock for free and direct callers must provide it.
+    void grow_to(std::size_t n);
+
+    /// Number of node slots the graph can address — not the number inserted.
+    /// This is the correct size for a `SearchScratch`, and it is what `search`
+    /// tops an undersized scratch up to.
+    [[nodiscard]] std::size_t capacity() const noexcept { return levels_.size(); }
 
     /// Algorithm 5. `ef_search` is clamped up to k (P-17): with ef < k the
     /// result set physically cannot hold k items, and returning fewer reads as
@@ -121,6 +142,31 @@ public:
     [[nodiscard]] std::vector<Neighbor> search(const float* query,
                                                std::size_t k,
                                                std::size_t ef_search) const;
+
+    /// Write the graph **and its vectors** to `path`, self-contained.
+    ///
+    /// Including the vectors is a deliberate cost (629 MB for SIFT1M against
+    /// 141 MB for the graph alone). The alternative -- graph only, re-attached
+    /// to a store the caller supplies -- makes the file useless without a store
+    /// that matches it *exactly*, and there is no cheap way to prove a given
+    /// store is the right one. A file that is wrong about which vectors it
+    /// indexes returns k plausible neighbours, which is the failure mode this
+    /// whole repo is organised against. See `CONTEXT.md` D15.
+    ///
+    /// The RNG state travels with the file, so an index that is saved, loaded
+    /// and then inserted into further produces the identical graph to one that
+    /// was never saved. Without it, `save`/`load` would silently become a
+    /// reproducibility hole exactly where P-03 says one is most expensive.
+    void save(const std::string& path) const;
+
+    /// Read an index written by `save`.
+    ///
+    /// The vectors are loaded into `store_out`, which the **caller owns** and
+    /// must outlive the returned index -- the same borrowing contract the
+    /// constructor has (D5). A self-contained `LoadedIndex { store; index; }`
+    /// would be a nicer signature and an unsafe one: the index holds a
+    /// reference into the store, so moving that struct would dangle it.
+    [[nodiscard]] static HnswIndex load(const std::string& path, VectorStore& store_out);
 
     /// A scratch buffer correctly sized for this index.
     [[nodiscard]] SearchScratch make_scratch() const;

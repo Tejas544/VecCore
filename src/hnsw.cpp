@@ -31,6 +31,24 @@ HnswIndex::HnswIndex(const VectorStore& store, HnswParams params)
     scratch_.visited.resize(n);
 }
 
+void HnswIndex::grow_to(std::size_t n) {
+    if (n <= levels_.size()) return;
+
+    // resize, not assign: every existing node's block must survive. links0_ is
+    // id-major with a fixed stride, so growing it appends whole blocks and moves
+    // nothing -- which is the property that makes the flat layout (D5) cheap to
+    // extend as well as cheap to scan.
+    links0_.resize(n * stride0_, 0);
+    upper_offset_.resize(n, 0);
+    levels_.resize(n, 0);
+
+    // The writer's own scratch has to cover the new ids before the next
+    // search_layer indexes into it. VisitedList::resize clears the stamps, which
+    // is harmless here: search_layer calls reset() before its first test_and_set
+    // regardless.
+    scratch_.visited.resize(n);
+}
+
 std::size_t HnswIndex::random_level() {
     // level = floor(-ln(U(0,1)) * mL), an exponentially decaying draw: most
     // nodes land at level 0, a few reach higher, one or two reach the top.
@@ -54,7 +72,7 @@ void HnswIndex::set_links(vec_id_t id, std::size_t layer, const std::vector<vec_
 
 SearchScratch HnswIndex::make_scratch() const {
     SearchScratch s;
-    s.visited.resize(store_.size());
+    s.visited.resize(capacity());
     return s;
 }
 
@@ -161,6 +179,12 @@ void HnswIndex::select_neighbors_heuristic(const float* base_vec,
 }
 
 void HnswIndex::insert(vec_id_t id) {
+    // An id past the constructed size is the incremental case, not an error.
+    // Without this the write to levels_[id] below is a silent out-of-bounds --
+    // it would not crash on a vector with spare capacity, which is the worst
+    // possible failure mode for it.
+    if (id >= levels_.size()) grow_to(static_cast<std::size_t>(id) + 1);
+
     const float* q = store_.at(id);
     const std::size_t level = random_level();
     levels_[id] = static_cast<std::uint8_t>(level);
@@ -260,6 +284,15 @@ std::vector<Neighbor> HnswIndex::search(const float* query,
                                         std::size_t ef_search,
                                         SearchScratch& scratch) const {
     if (empty_) return {};
+
+    // A scratch made before an incremental insert is too small for the ids that
+    // insert created, and VisitedList indexes without a bounds check because it
+    // sits in the hottest loop in the project. Topping up here is what keeps a
+    // long-lived per-thread scratch valid across a growing index. The scratch is
+    // caller-owned and thread-local by contract (B-10), so this write races with
+    // nothing.
+    if (scratch.visited.size() < capacity()) scratch.visited.resize(capacity());
+
     const std::size_t ef = std::max(ef_search, k);  // P-17
 
     vec_id_t ep = entry_point_;

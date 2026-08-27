@@ -6,6 +6,7 @@ project(veccore VERSION 0.1.0 LANGUAGES CXX)
 # ---------------------------------------------------------------------------
 option(VECCORE_BUILD_TESTS "Build the doctest suite"                    ON)
 option(VECCORE_BUILD_BENCH "Build the benchmark harness"                ON)
+option(VECCORE_BUILD_TOOLS "Build the developer tools (hybrid_eval)"    ON)
 option(VECCORE_ASAN        "AddressSanitizer + UBSan (Debug default)"   OFF)
 option(VECCORE_TSAN        "ThreadSanitizer -- Phase 5, separate build" OFF)
 option(VECCORE_NATIVE      "-march=native in Release"                   ON)
@@ -114,6 +115,7 @@ configure_file(
 add_library(veccore STATIC
   src/stamp.cpp
   src/xvecs.cpp
+  src/serialize.cpp
   src/hnsw.cpp
   src/kmeans.cpp
   src/pq.cpp
@@ -146,8 +148,13 @@ endif()
 
 # EdgeRAG hybrid evaluation (D7). Lives in tools/ because the TF-IDF baseline
 # it contains is a baseline, not a component -- same treatment as FAISS.
-add_executable(hybrid_eval tools/hybrid_eval.cpp)
-target_link_libraries(hybrid_eval PRIVATE veccore)
+#
+# Gated so a wheel build does not compile it: `pip install .` wants the extension
+# and nothing else, and an evaluation harness is a developer target.
+if(VECCORE_BUILD_TOOLS)
+  add_executable(hybrid_eval tools/hybrid_eval.cpp)
+  target_link_libraries(hybrid_eval PRIVATE veccore)
+endif()
 
 # ---------------------------------------------------------------------------
 # Python bindings. Optional: the library must build and test without them, so a
@@ -160,6 +167,15 @@ if(VECCORE_BUILD_PYTHON)
     pybind11_add_module(_veccore bindings/veccore_py.cpp)
     target_link_libraries(_veccore PRIVATE veccore)
     message(STATUS "  python     : pybind11 ${pybind11_VERSION} -> _veccore")
+
+    # Without this the wheel contains the two .py files and no extension, and
+    # `pip install veccore` produces a package whose import fails. scikit-build-core
+    # packages what CMake's install() rules emit, and pybind11_add_module does not
+    # add one -- a 19 KB wheel is the only symptom, which is easy to miss because
+    # the build itself succeeds.
+    if(SKBUILD)
+      install(TARGETS _veccore DESTINATION veccore)
+    endif()
   else()
     message(STATUS "  python     : pybind11 not found, skipping _veccore")
   endif()

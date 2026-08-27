@@ -1,8 +1,15 @@
 # VecCore — Execution Plan
 
-**Status:** COMPLETE — all six phase gates green as of 2026-08-22. D1 (schedule), D2 (environment) and the C++-ramp question were resolved
-2026-08-21 — see `CONTEXT.md`. D3 is confirmed at Phase 0.
-**Window:** **Aug 21 evening → Aug 25, hard stop.** The spec said Aug 19–24; see §0.1 for why.
+**Status:** COMPLETE — all six phase gates green as of **2026-08-27**. D1 (schedule), D2 (environment) and the C++-ramp question were resolved
+2026-08-21 — see `CONTEXT.md`. D3 was confirmed at Phase 0.
+**Window planned:** Aug 21 evening → Aug 25, hard stop. The spec said Aug 19–24; see §0.1 for why.
+**Window actual:** **Aug 22, Aug 26, Aug 27 — three working days**, not the four contiguous ones §0.1
+costed. Phases 0–2 landed Aug 22, Phases 3–5 on Aug 26, Phase 6 on Aug 27.
+
+§0.1 is left exactly as written. It is the record of a decision made with the information available
+on Aug 21, not a forecast to be quietly corrected once the outcome is known — and the gap between
+the two is itself the useful part. Every gate date in §4 and every entry date in `BUGS.md` is the
+date of the commit that landed it, so `git log` corroborates this file rather than contradicting it.
 **Source of truth for scope:** `02_VECCORE.md`. This file is *how*, not *what*.
 **Read `WHAT_IS_THIS.md` first if any term below is unfamiliar.**
 
@@ -254,13 +261,13 @@ on a 3½-day budget, debugging two layers at once is how days disappear.
 
 | Phase | Exit criterion |
 |---|---|
-| 0 | ✅ **PASSED 2026-08-21.** `asan_probe` aborts with a heap-buffer-overflow report; 22 tests green; `bench` writes a trusted record |
+| 0 | ✅ **PASSED 2026-08-22.** `asan_probe` aborts with a heap-buffer-overflow report; 22 tests green; `bench` writes a trusted record |
 | 1 | ✅ **PASSED 2026-08-22.** Brute force = 1.0000 recall@10 vs the SIFT10K fixture (5 trials). On full SIFT1M vs the *published* ground truth: 0.9995, and every disagreement proven to be an exact distance tie (`scripts/diagnose_recall.py`), which is the real criterion — an exact id match is unachievable where the data ties. `bench` writes stamped JSON records |
 | 2 | ✅ **PASSED 2026-08-22.** SIFT10K: 0.9952 @ ef=40. **SIFT1M: 0.9755 @ ef=80, 1,934 QPS — 150× brute force.** Recall monotone in `ef_search` across the whole sweep; level histogram matches 1/M to three decimals; 37/37 tests green under ASan+UBSan |
-| 3 | ✅ **PASSED 2026-08-22, one criterion REVISED.** Reconstruction MSE monotone in `m` (39924→24165→10847→3665) ✅. **ADC-only recall at 16× is 0.7186, not the ≥0.80 written here — and that target was wrong, not the code.** FAISS `IndexPQ` on identical data at the same `m` gets **0.7059**, so we are 1.8% *ahead* of the reference implementation at 0.89× its QPS. The 0.80 was an estimate written before measuring. Replacement criterion, evidence-based: recall within 5% of FAISS at matched `m`, and **ADC + exact rerank top-100 ≥ 0.95** — measured 0.9656 at 32× and 0.9987 at 16× |
-| 4 | ✅ **PASSED 2026-08-22.** BM25 matches hand-derived arithmetic to 1e-9 (the expected value is derived in the test from the formula, not pasted from a run). On EdgeRAG's real 362-doc / 650-query corpus: **BM25 beats TF-IDF +4.17% relative at recall@5** and is **11× faster**. RRF measured *negative* (0.1862 vs BM25's 0.1923) — investigated rather than reported flat, see B-08 |
-| 5 | ✅ **PASSED 2026-08-22.** 4-thread read QPS **3.37×** single-thread (in-cache) / **2.84×** (out-of-cache). TSan clean over all 7 concurrency tests, **and `tsan_probe` proves TSan actually fires** (L-01's lesson, second sanitizer). Found and fixed two real concurrency defects: B-10 (a `const` method writing shared state) and **B-11 (4 readers starve the writer completely — insert p99 4,446 ms → 0.79 ms after the fix)** |
-| 6 | ✅ **PASSED 2026-08-22.** FAISS `IndexHNSWFlat` and `IndexPQ` vs VecCore on identical data, matched parameters, both pinned to one thread. **Recall within 0.002 of FAISS at every `ef_search`; throughput 1.6–1.75× behind; build 1.51× behind** — inside the spec's 2–3× target. pybind11 module + 21 Python tests; EdgeRAG drop-in with the crossover measured at n≈1,189 |
+| 3 | ✅ **PASSED 2026-08-26, one criterion REVISED.** Reconstruction MSE monotone in `m` (39924→24165→10847→3665) ✅. **ADC-only recall at 16× is 0.7186, not the ≥0.80 written here — and that target was wrong, not the code.** FAISS `IndexPQ` on identical data at the same `m` gets **0.7059**, so we are 1.8% *ahead* of the reference implementation at 0.89× its QPS. The 0.80 was an estimate written before measuring. Replacement criterion, evidence-based: recall within 5% of FAISS at matched `m`, and **ADC + exact rerank top-100 ≥ 0.95** — measured 0.9656 at 32× and 0.9987 at 16× |
+| 4 | ✅ **PASSED 2026-08-26.** BM25 matches hand-derived arithmetic to 1e-9 (the expected value is derived in the test from the formula, not pasted from a run). On EdgeRAG's real 362-doc / 650-query corpus: **BM25 beats TF-IDF +4.17% relative at recall@5** and is **11× faster**. RRF measured *negative* (0.1862 vs BM25's 0.1923) — investigated rather than reported flat, see B-08 |
+| 5 | ✅ **PASSED 2026-08-26.** 4-thread read QPS **3.37×** single-thread (in-cache) / **2.84×** (out-of-cache). TSan clean over all 7 concurrency tests, **and `tsan_probe` proves TSan actually fires** (L-01's lesson, second sanitizer). Found and fixed two real concurrency defects: B-10 (a `const` method writing shared state) and **B-11 (4 readers starve the writer completely — insert p99 4,446 ms → 0.79 ms after the fix)** |
+| 6 | ✅ **PASSED 2026-08-27.** FAISS `IndexHNSWFlat` and `IndexPQ` vs VecCore on identical data, matched parameters, both pinned to one thread. **Recall within 0.002 of FAISS at every `ef_search`; throughput 1.6–1.75× behind; build 1.51× behind** — inside the spec's 2–3× target. pybind11 module + 21 Python tests; EdgeRAG drop-in with the crossover measured at n≈1,189 |
 
 ---
 

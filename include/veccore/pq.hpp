@@ -102,6 +102,25 @@ public:
                                                       std::size_t candidates,
                                                       const VectorStore& full) const;
 
+    /// Write codebooks, codes and parameters to `path`.
+    ///
+    /// This is the persistence case with the clearest payoff in the repo:
+    /// training codebooks at SIFT1M takes **86.5 s** and loading them takes
+    /// milliseconds. The codes are the compressed representation, so the file is
+    /// small by construction -- 30.6 MiB at m=32 against 488 MiB of vectors.
+    ///
+    /// The **vectors are not included**, which is the opposite choice from
+    /// `HnswIndex::save` and for a reason worth being able to state: writing
+    /// them would multiply a 30 MiB artifact by 16x to carry data that only
+    /// `search_rerank` needs. So a loaded quantizer can `search` immediately and
+    /// can `search_rerank` only if the caller supplies the store -- which is
+    /// already how that method's signature works. `CONTEXT.md` D15.
+    void save(const std::string& path) const;
+
+    /// Read a quantizer written by `save`. The result can `search` at once;
+    /// `search_rerank` still needs a `VectorStore` from the caller.
+    [[nodiscard]] static ProductQuantizer load(const std::string& path);
+
     /// Decode a code back to an approximate vector -- used only to measure
     /// reconstruction error, never in the search path.
     void decode(const std::uint8_t* code, float* out) const;

@@ -67,6 +67,8 @@ the code rather than the test.
 | B-10 | A `const` search method wrote to shared members; TSan-confirmed race | data race | ~20 min |
 | B-11 | **4 readers starve the writer entirely — inserts stop happening** | data race / starvation | ~45 min |
 | B-12 | An unmeasured number in the *limitations* section, overstating our own gap 7× | baseline mismatch | ~5 min |
+| B-13 | A locked class handed out an unlocked reference; growth turned it into a real race | data race | ~25 min |
+| B-14 | A GIL test measured the binding's own marshalling cost, not the GIL | measurement that measured nothing | ~20 min |
 
 **Phase 0 scorecard:** 7 landmines defused, 0 confirmed bugs, ~1.5 h. Four of the seven
 (L-01, L-02, L-05, L-06) were found by checking a tool *before* depending on it rather than after.
@@ -93,6 +95,14 @@ Classes worth labelling, because they are the categories an interviewer will rec
 **silent recall loss** · **measurement that measured nothing** · **cache-hostile layout** ·
 **data race** · **uninitialised / undefined behaviour** · **format misread** ·
 **baseline mismatch** · **unreproducible by construction**
+
+**How the dates work, because this file invites the check.** A `B-nn` date is the date of the commit
+that landed the fix, so `git log` corroborates it — Phases 0–2 on **Aug 22**, Phases 3–5 on **Aug 26**,
+Phase 6 on **Aug 27** (`PLAN.md` §0 records why the window is three days rather than four contiguous
+ones). The exception is the **L-01 … L-06 planning landmines dated Aug 21**: those were found during
+the planning session, which is a day *before this repository's first commit* — they were written down
+in this file and committed with it on Aug 22. That is the one place where a date is deliberately
+earlier than any commit, and this paragraph exists so it reads as a fact rather than as drift.
 
 ---
 
@@ -288,7 +298,7 @@ missing half its data with nobody noticing. Same shape as L-07: degrade, but nev
 
 ---
 
-### B-07 · k-means++ is not enough, and a test with random data hid it · 2026-08-22 · Phase 3
+### B-07 · k-means++ is not enough, and a test with random data hid it · 2026-08-26 · Phase 3
 
 **Symptom:** `TEST_CASE("k-means recovers obvious clusters")` failed on four well-separated blobs.
 Every other k-means test passed, including monotone inertia and the empty-cluster guard.
@@ -344,7 +354,7 @@ to be both.
 
 ---
 
-### B-08 · RRF made retrieval *worse*, and the interesting part is why · 2026-08-22 · Phase 4
+### B-08 · RRF made retrieval *worse*, and the interesting part is why · 2026-08-26 · Phase 4
 
 **Not a code bug** — every RRF unit test passes, including hand-computed arithmetic and the
 scale-invariance property. This is a **measured negative result**, and it is logged here because
@@ -411,7 +421,7 @@ limitation rather than substituted with a flattering number.
 
 ---
 
-### B-09 · `git stash pop` failed silently and I nearly built on the wrong source · 2026-08-22 · Phase 4
+### B-09 · `git stash pop` failed silently and I nearly built on the wrong source · 2026-08-26 · Phase 4
 
 **Symptom:** after stashing to get a clean tree, running a binary, and popping, the source file was
 back to its pre-edit state. `grep -c mean_overlap tools/hybrid_eval.cpp` returned **0** for changes
@@ -440,7 +450,7 @@ files changed.**
 
 ---
 
-### B-10 · A `const` search method that was never safe to call concurrently · 2026-08-22 · Phase 5
+### B-10 · A `const` search method that was never safe to call concurrently · 2026-08-26 · Phase 5
 
 **Found by:** designing the locking layer, before writing any threaded code. Phase 2's
 `HnswIndex::search` is `const`, takes no mutable arguments, and returns a value. It also writes to
@@ -495,7 +505,7 @@ fire.
 
 ---
 
-### B-11 · Four readers starve the writer completely — the index stops accepting inserts · 2026-08-22 · Phase 5
+### B-11 · Four readers starve the writer completely — the index stops accepting inserts · 2026-08-26 · Phase 5
 
 **Symptom.** The concurrent read+insert test ran for **ten minutes at 400% CPU** and never
 finished. Four reader threads, one writer inserting 2000 vectors.
@@ -564,7 +574,7 @@ the code rather than the test.
 
 ---
 
-### B-12 · I put an unmeasured number in the limitations section · 2026-08-22 · Phase 6
+### B-12 · I put an unmeasured number in the limitations section · 2026-08-27 · Phase 6
 
 **Symptom.** The README's limitations section said, of HNSW build time:
 
@@ -600,9 +610,119 @@ record in `results/`" and I had been reading that as applying to the *claims*. I
 
 ---
 
+### B-13 · A locked class handed out an unlocked reference, and growth made it dangerous · 2026-08-27 · Phase 6
+
+**Symptom:** The first run of a new test — `growing inserts do not corrupt concurrent readers` —
+passed under Release and failed under ThreadSanitizer:
+
+```
+WARNING: ThreadSanitizer: data race
+  Write of size 8 by main thread (mutexes: write M0, write M1):
+    veccore::HnswIndex::grow_to(unsigned long)  src/hnsw.cpp:43
+    veccore::ConcurrentHnsw::insert(float const*)  concurrent.hpp:163
+  Previous read of size 8 by thread T4:
+    veccore::HnswIndex::capacity() const  include/veccore/hnsw.hpp:122
+```
+
+Note what the report says about the writer: **`mutexes: write M0, write M1`.** The writer was
+holding both the turnstile and the unique_lock. It was doing everything right.
+
+**Wrong theory:** that the new `insert(const float*)` path had a hole in it — that the store append
+was escaping the exclusive section somehow, which is precisely the hazard the overload was written
+to close. Plausible, and it sent me back to re-read the lock ordering twice before reading the
+*other* stack in the report.
+
+**Root cause:** the reader, not the writer. `ConcurrentHnsw::index()` returns the bare
+`const HnswIndex&`, and my reader thread called `index.index().capacity()` on it to bound-check
+returned ids. That reference reaches straight past the mutex the class exists to hold.
+
+The interesting part is that this accessor had been there since Phase 5 and was not a bug then.
+Before growth existed, `levels_`, `links0_` and `upper_offset_` were sized once in the constructor
+and never resized, so reading their `size()` while a writer mutated their *contents* was benign in
+practice. Adding `grow_to` turned every one of those buffers into something that reallocates under a
+concurrent reader, and the same unchanged accessor became a genuine race.
+
+**A safe operation became unsafe without being edited.** That is the failure mode that makes
+"add incremental insert" a bigger change than it looks: the hazard is not in the new code, it is in
+what the new code invalidates about the old code.
+
+**Diagnosis:** read the second stack. The habit worth keeping is that a TSan report names two
+accesses and the interesting one is often not the one you just wrote — the `mutexes:` annotation on
+the writer frame was the tell, because a writer holding two locks is not the side that is wrong.
+
+**Fix:** locked accessors on `ConcurrentHnsw` — `capacity()`, `stats()`, `graph_bytes()`,
+`check_invariants()` — each taking the shared lock, because "how big is the graph, is it still
+sound" are exactly the questions you want to ask *while* inserts are happening. `index()` survives
+for the after-join case and now carries a doc comment saying what it does not protect. The binding's
+`stats()` and `graph_bytes()` were routed through the locked versions; they had the identical latent
+race, reachable from Python the moment `add` shipped.
+
+**Prevention:** the growth tests run under TSan in CI (`.github/workflows/ci.yml`), and the reader
+loop now bound-checks against a constant it already knows rather than asking the index.
+
+**Cost:** ~25 minutes. Zero of it debugging the code that was actually correct, because the report
+said which thread held which mutex and that ruled the writer out in one read.
+
+---
+
+### B-14 · The GIL test that measured its own overhead · 2026-08-27 · Phase 6
+
+**Symptom:** a new test asserting that `PqIndex.search` releases the GIL failed, twice, and the
+numbers got *worse* when I gave it more work:
+
+```
+draft 1:  20 searches   4 threads took 5.85x the single-threaded time
+draft 2: 300 searches   4 threads took 4.25x
+```
+
+4.0x is the signature of a fully serialised call. 4.25x looks like a held GIL with thread overhead
+on top. The obvious reading was that `py::gil_scoped_release` was missing or ineffective on the PQ
+path.
+
+**Wrong theory:** exactly that — and it was attractive because the release *had* just been written,
+so "I got it wrong" was more likely than "the measurement is wrong". I nearly went looking for a
+reason `gil_scoped_release` might not apply inside a `const` method.
+
+**Root cause:** the GIL was released the whole time. Sweeping the index size settles it:
+
+```
+n=  3,000     22.6 us/search     4-thread ratio 4.90x
+n= 50,000    291.9 us/search     4-thread ratio 1.33x
+n=200,000   1205.7 us/search     4-thread ratio 1.27x
+```
+
+At n=3,000 an ADC scan over 3,000 codes takes ~20 µs, while the per-call Python work wrapped around
+it — `forcecast` on the query array, building two numpy arrays for the result — is of the same order
+and runs *with the GIL held*. So four threads serialised on the part that was never releasable, and
+the part that was released was too small to see. The test was reporting on the binding's fixed
+marshalling cost, which is not what it claimed to measure.
+
+**Diagnosis:** sweep the parameter you are implicitly holding constant. The failing number was
+stable and reproducible, which is what made it convincing; what it was not was *sensitive to the
+thing under test*. One three-point sweep separated "the GIL is held" from "the GIL is irrelevant at
+this size".
+
+**Fix:** the test builds its own 50,000-vector index instead of reusing the 3,000-vector module
+fixture, and carries the sweep in its docstring so the next person does not rediscover it.
+
+**Prevention:** the docstring, and the shape of the existing HNSW GIL test, which uses `reps = 400`
+against a 3,000-vector index for the same reason — HNSW search at ef=200 is slow enough per call
+that it never had this problem, which is why the pattern was there to copy and I copied only half
+of it.
+
+**This is B-05 in a different phase.** B-05 was a layout benchmark that did not reproduce the
+pathology it was built to demonstrate; this is a concurrency test that did not exercise the
+concurrency it was built to prove. Both failed the same way: **a measurement whose fixed overhead is
+larger than its signal reports on the harness, not on the code.** The tell is identical — the result
+does not move when you change the thing it is supposedly measuring.
+
+**Cost:** ~20 minutes, and it would have cost hours if I had "fixed" the binding instead of the test.
+
+---
+
 ## Defused landmines
 
-### L-09 · ThreadSanitizer aborts at startup on this kernel unless ASLR is off · 2026-08-22 · Phase 5
+### L-09 · ThreadSanitizer aborts at startup on this kernel unless ASLR is off · 2026-08-26 · Phase 5
 
 `tsan_probe` died before running a single line:
 
@@ -637,6 +757,32 @@ Things that would have cost hours, caught before they did. **These count.** "I c
 tooling could actually catch memory bugs before I started writing code that would need it" is a
 real engineering answer, and it is the kind of thing nobody thinks to claim because it never became
 a war story.
+
+**AMENDED 2026-08-27 — `setarch -R ctest` only covered half of it.**
+
+Documenting the command fixed the *test run*. It could not fix the *build*, because
+`doctest_discover_tests` executes the freshly linked binary at build time to enumerate the test
+cases, and nothing a user types wraps that. Touching `test_concurrent.cpp` in Phase 6 forced a relink
+and the TSan build started failing with:
+
+```
+FATAL: ThreadSanitizer: unexpected memory mapping 0x5d71be7ed000-0x5d71be7f3000
+CMake Error at doctestAddTests.cmake:45 (message): Error running test executable
+    Result: 66
+    Output:
+ninja: build stopped: subcommand failed.
+```
+
+An empty `Output:` and a CMake error inside a build step reads exactly like a compile failure, and
+the first instinct is to go looking at the code that just changed. It is the same landmine, one
+layer earlier.
+
+The real fix is in `tests/CMakeLists.txt`: set `CROSSCOMPILING_EMULATOR` to `setarch -R` on the test
+target when `VECCORE_TSAN` is on. That is the launcher doctest threads through to both the
+enumeration command *and* every `add_test()` it generates — so the build works and a bare `ctest`
+is now correct too, with no wrapper for anyone to forget. **A workaround that lives in a README is a
+workaround that is one unfamiliar contributor away from being lost;** this one now lives in the
+build system.
 
 ### L-01 · The local toolchain cannot run the sanitizers the plan depends on · 2026-08-21 · Phase 0 (planning)
 
@@ -1029,14 +1175,43 @@ are preparing answers in December.
 
 | Phase | Predicted | Hit | Novel | Hours lost |
 |---|---|---|---|---|
-| 0 · Rails | | | | |
-| 1 · Storage + harness | | | | |
-| 2 · HNSW | | | | |
-| 3 · PQ | | | | |
-| 4 · BM25 + RRF | | | | |
-| 5 · Concurrency | | | | |
-| 6 · Bindings + baseline | | | | |
+| 0 · Rails | 3 · P-01, P-02, P-14 | 0 | 0 bugs — **7 landmines defused** (L-01…L-07) | ~1.5 |
+| 1 · Storage + harness | 4 · P-10…P-13 | **1** · P-12 (ties at rank *k*) | 3 · B-02, B-03, B-04 | ~1.0 |
+| 2 · HNSW | 11 · P-03…P-06, P-09, P-15…P-20 | 0 | 1 · B-06 | ~0.2 |
+| 3 · PQ | 5 · P-07, P-21…P-24 | 0 | 1 · B-07 | ~0.4 |
+| 4 · BM25 + RRF | 4 · P-08, P-25…P-27 | 0 | 1 · B-09 *(+ B-08, a null result, not a bug)* | ~0.6 |
+| 5 · Concurrency | 4 · P-28…P-31 | **1** · P-30 (the confident wrong explanation) | 3 · B-10, B-11, L-09 | ~1.1 |
+| 6 · Bindings + baseline | 5 · P-32…P-36 | **1** · P-35 (the GIL, from the other side) | 3 · B-12, B-13, B-14 | ~0.9 |
+| **Total** | **36** | **3** | **12** | **~5.7 h** |
+
+Plus **two out-of-phase class hits**, which are the most interesting cells in the table and do not
+fit a column: **B-01** is P-04's failure class (comparator polarity) firing in Phase 1's `TopK`
+rather than in Phase 2's search heaps, and **B-05** is P-30's (a confident wrong explanation) firing
+against the *layout* benchmark three phases before the concurrency work it was registered for. Both
+were caught quickly **because the prediction existed**, just filed under the wrong phase. Registering
+a failure *mode* turns out to generalise better than registering a failure *site*.
+
+The ~4.9 h is attention, not wall-clock. B-02 alone burned **4 h 48 m of unattended wall-clock** on a
+hung fetch while costing about 20 minutes of thought — those are different quantities and averaging
+them would hide the only lesson the entry has.
 
 **"Hit"** = a predicted failure that actually happened. **"Novel"** = something this file did not
 anticipate — those are the most valuable entries in the whole document, because they are the ones
 that prove the log is real rather than reconstructed.
+
+**What the shape of this table actually says.** 36 failure modes were pre-registered and **3 were
+hit**, while **12 of the 15 logged entries were novel** — so the register's value was not its
+accuracy. Phase 2 is the clearest case: 11 predictions, the widest error bar in `PLAN.md`, and **zero
+hits and one trivial novel bug**, because §2.7's ordered verification meant every prediction was
+being actively checked for rather than waited for. The predictions that "missed" were mostly
+converted into guards before they could fire, which is the outcome you want and the one that makes a
+bug log look thin. The phases with real novelty — 1, 3, 5 and 6 — are the ones where something was
+being measured for the first time rather than transcribed from a paper.
+
+**Phase 6 grew after the gate, and the count above reflects that.** Exposing incremental insert and
+PQ through the bindings produced B-13 and B-14 on its own, which is the honest argument against
+treating a phase gate as the end of a phase: the gate proved the six things it was written to prove,
+and the seventh thing — *is this API safe when someone actually calls it from Python* — was not one
+of them. P-35 counts as a hit here in an unusual direction. It predicted a held GIL would make the
+scaling claims false; what happened is that a test *believed* the GIL was held and was wrong (B-14).
+The prediction was still what made the failure legible in ten minutes instead of an afternoon.

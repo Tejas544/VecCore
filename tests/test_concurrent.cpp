@@ -283,3 +283,194 @@ TEST_CASE("each thread's scratch counts only its own distance calls") {
     a.reset_counters();
     CHECK(a.distance_calls == 0);
 }
+
+// ---------------------------------------------------------------------------
+// Growth: adding vectors to an index that was already built.
+//
+// Every test above pre-sizes the store and inserts a prefix, which is what the
+// benchmarks do and what made the reallocation hazard invisible for five
+// phases. These tests grow the store *after* construction, which is the path a
+// Python caller takes and the only path where `VectorStore::add` can move the
+// buffer under a reader.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("an index grows past the size it was constructed at") {
+    // Without HnswIndex::grow_to, `levels_[id]` here is an out-of-bounds write
+    // into a vector that usually has spare capacity -- so it would not crash,
+    // it would corrupt a neighbouring allocation and still return k results.
+    VectorStore store = random_store(500, 16, 4242);
+    HnswParams p;
+    p.M = 16;
+    p.ef_construction = 100;
+    p.seed = 7;
+
+    ConcurrentHnsw index(store, p);
+    index.build();
+    REQUIRE(index.growable());
+    REQUIRE(index.index().capacity() == 500);
+
+    std::mt19937_64 rng(99);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    std::vector<float> v(16);
+
+    SearchScratch scratch = index.make_scratch();
+    for (std::size_t i = 0; i < 500; ++i) {
+        for (auto& x : v) x = u(rng);
+        const vec_id_t id = index.insert(v.data());
+        CHECK(id == 500 + i);
+
+        // The vector just added must be its own nearest neighbour at distance
+        // zero. A graph that grew its arrays but never linked the node would
+        // return k results happily and fail exactly here.
+        const auto hits = index.search(v.data(), 1, 64, scratch);
+        REQUIRE(hits.size() == 1);
+        CHECK(hits[0].id == id);
+        CHECK(hits[0].dist == doctest::Approx(0.0f));
+    }
+
+    CHECK(index.index().capacity() == 1000);
+    CHECK(store.size() == 1000);
+    CHECK(index.index().check_invariants() == "");
+}
+
+TEST_CASE("a scratch built before growth stays valid after it") {
+    // VisitedList indexes without a bounds check -- it is the hottest loop in
+    // the project. A long-lived per-thread scratch made when the index held n
+    // nodes is therefore a latent out-of-bounds read the moment the index holds
+    // n+1, unless search() tops it up.
+    VectorStore store = random_store(300, 16, 31);
+    HnswParams p;
+    p.M = 8;
+    p.ef_construction = 64;
+    ConcurrentHnsw index(store, p);
+    index.build();
+
+    SearchScratch old_scratch = index.make_scratch();   // sized for 300
+    REQUIRE(old_scratch.visited.size() == 300);
+
+    std::mt19937_64 rng(32);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    std::vector<float> v(16);
+    for (std::size_t i = 0; i < 200; ++i) {
+        for (auto& x : v) x = u(rng);
+        index.insert(v.data());
+    }
+
+    // Reused as-is, deliberately: no caller re-made it.
+    const auto hits = index.search(v.data(), 10, 64, old_scratch);
+    CHECK(hits.size() == 10);
+    CHECK(hits[0].id == 499);
+    CHECK(old_scratch.visited.size() >= 500);
+}
+
+TEST_CASE("growing inserts do not corrupt concurrent readers") {
+    // The reallocation race, exercised directly. Readers run continuously while
+    // the store doubles in size; VectorStore::add reallocates several times over
+    // this range. Under TSan this is the test that would report the race if the
+    // append happened outside the exclusive section.
+    VectorStore store = random_store(1000, 16, 555);
+    HnswParams p;
+    p.M = 16;
+    p.ef_construction = 100;
+    ConcurrentHnsw index(store, p);
+    index.build();
+
+    // The final size, as a constant. The first draft of this test read
+    // `index.index().capacity()` from inside the reader loop, which reaches past
+    // the lock into arrays that grow_to reallocates -- TSan reported it, and it
+    // was the test that was wrong, not the library (B-13). A reader that needs a
+    // bound either takes the lock or uses a value it already knows.
+    constexpr std::uint32_t kFinalN = 2000;
+
+    std::atomic<bool> stop{false};
+    std::atomic<std::size_t> searches{0};
+    std::atomic<bool> bad_result{false};
+
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t) {
+        readers.emplace_back([&, t] {
+            std::mt19937_64 rng(1000 + t);
+            std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+            std::vector<float> q(16);
+            SearchScratch scratch = index.make_scratch();
+            while (!stop.load(std::memory_order_relaxed)) {
+                for (auto& x : q) x = u(rng);
+                const auto hits = index.search(q.data(), 10, 32, scratch);
+                if (hits.size() != 10) bad_result.store(true);
+                for (const auto& h : hits) {
+                    // An id past the graph, or a NaN distance, is what a
+                    // use-after-free on the vector buffer looks like.
+                    if (h.id >= kFinalN || !std::isfinite(h.dist)) {
+                        bad_result.store(true);
+                    }
+                }
+                searches.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    std::mt19937_64 rng(2000);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    std::vector<float> v(16);
+    for (std::size_t i = 0; i < 1000; ++i) {
+        for (auto& x : v) x = u(rng);
+        index.insert(v.data());
+    }
+
+    stop.store(true);
+    for (auto& th : readers) th.join();
+
+    CHECK(searches.load() > 0);
+    CHECK_FALSE(bad_result.load());
+    CHECK(store.size() == kFinalN);
+    // Safe unlocked here and only here: every thread is joined.
+    CHECK(index.index().check_invariants() == "");
+}
+
+TEST_CASE("batch insert lands the same graph as one-at-a-time") {
+    // insert_batch exists to take the lock once, not to take a shortcut. Same
+    // seed, same vectors, same order => byte-identical outcome, or the batch
+    // path is doing something the single path is not.
+    const VectorStore extra = random_store(200, 16, 8080);
+
+    auto build_with = [&](bool batched) {
+        VectorStore store = random_store(400, 16, 909);
+        HnswParams p;
+        p.M = 16;
+        p.ef_construction = 100;
+        p.seed = 4;
+        ConcurrentHnsw index(store, p);
+        index.build();
+        if (batched) {
+            index.insert_batch(extra.at(0), extra.size(), extra.dim());
+        } else {
+            for (vec_id_t i = 0; i < extra.size(); ++i) index.insert(extra.at(i));
+        }
+        const VectorStore queries = random_store(40, 16, 1234);
+        std::vector<vec_id_t> flat;
+        SearchScratch s = index.make_scratch();
+        for (vec_id_t q = 0; q < queries.size(); ++q) {
+            for (const auto& n : index.search(queries.at(q), 10, 64, s)) flat.push_back(n.id);
+        }
+        return flat;
+    };
+
+    CHECK(build_with(true) == build_with(false));
+}
+
+TEST_CASE("an index over a const store refuses to grow, and says why") {
+    // The const-store constructor is still the right default: bench and the
+    // tests above size their stores up front and must not pay for a growth path
+    // they never use. Asking it to grow is a programming error, not a runtime
+    // condition, so it throws rather than returning a sentinel.
+    const VectorStore store = random_store(100, 16, 77);
+    HnswParams p;
+    p.M = 8;
+    ConcurrentHnsw index(store, p);
+    index.build();
+
+    CHECK_FALSE(index.growable());
+    std::vector<float> v(16, 0.5f);
+    CHECK_THROWS_AS(index.insert(v.data()), std::logic_error);
+    CHECK_THROWS_AS(index.insert_batch(v.data(), 1, 16), std::logic_error);
+}

@@ -430,6 +430,62 @@ def markdown_table(records: list[dict], out: Path) -> None:
     print(f"  wrote {path}")
 
 
+def head_to_head_table(records: list[dict], out: Path) -> None:
+    """The VecCore-vs-FAISS table, paired by ef_search and generated from records.
+
+    This one is separate from `markdown_table` because pairing is the whole
+    point: a row that shows VecCore's number next to FAISS's is only meaningful
+    if both came from the same interleaved session at the same parameters, and
+    building it by hand is how a p99 column goes missing for a month. Rows are
+    emitted only where both sides exist at the same ef_search, so a half-measured
+    sweep produces a shorter table rather than a misaligned one.
+    """
+    ours: dict[int, dict] = {}
+    theirs: dict[int, dict] = {}
+    for r in records:
+        p = r["index_params"]
+        if r["n_base"] != 1_000_000:
+            continue
+        ef = p.get("ef_search")
+        if r["index"] == "hnsw" and ef:
+            ours[int(ef)] = r
+        elif r["index"] == "faiss_hnsw" and ef:
+            theirs[int(ef)] = r
+
+    shared = sorted(set(ours) & set(theirs))
+    if not shared:
+        print("  head_to_head: no paired ef_search points; skipping")
+        return
+
+    lines = [
+        "| ef_search | VecCore recall@10 | FAISS recall@10 | VecCore QPS | FAISS QPS "
+        "| VecCore p99 ms | FAISS p99 ms | FAISS faster by |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for ef in shared:
+        a, b = ours[ef]["measurements"], theirs[ef]["measurements"]
+        ratio = b["qps_mean"] / a["qps_mean"] if a["qps_mean"] else float("nan")
+        lines.append(
+            f"| {ef} | {a['recall_at_k']:.4f} | {b['recall_at_k']:.4f} | "
+            f"{a['qps_mean']:,.0f} | {b['qps_mean']:,.0f} | "
+            f"{a['latency_p99_ms']:.3f} | {b['latency_p99_ms']:.3f} | {ratio:.2f}x |"
+        )
+
+    # Build time is a property of the index, not of an ef_search point, so it is
+    # a footer row rather than a column repeated identically down the table.
+    a_build = ours[shared[0]]["measurements"].get("build_ms")
+    b_build = theirs[shared[0]]["measurements"].get("build_ms")
+    if a_build and b_build:
+        lines.append(
+            f"| **build** | | | | | | | **{a_build / 1000:,.0f} s vs {b_build / 1000:,.0f} s "
+            f"= {a_build / b_build:.2f}x** |"
+        )
+
+    path = out / "head_to_head.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"  wrote {path}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", default="results/bench.jsonl")
@@ -456,6 +512,7 @@ def main() -> int:
     writer_starvation(records, out)
     layout_ab(records, out)
     markdown_table(records, out)
+    head_to_head_table(records, out)
     return 0
 
 

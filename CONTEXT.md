@@ -92,7 +92,7 @@ past 90 minutes with nothing compiling, take the fallback and log it here.
 
 ---
 
-## D3 · SIFT1M for headline numbers, SIFT10K as the inner-loop fixture · **PROPOSED** · 2026-08-21
+## D3 · SIFT1M for headline numbers, SIFT10K as the inner-loop fixture · **ACCEPTED** · 2026-08-21 · **CONFIRMED at Phase 0, 2026-08-22**
 
 **Decision.** Every unit test and every correctness check runs on the first 10,000 SIFT base
 vectors. SIFT1M appears only in `bench`, and only after a gate is green on 10K.
@@ -115,6 +115,26 @@ exists to handle. You would get recall numbers that do not transfer to any real 
 **Note:** synthetic data *is* used for one thing — the corpus-size crossover curve in Phase 6.3,
 where the question is "at what n does HNSW overtake brute force" and the answer only needs
 realistic dimensionality, not realistic structure. Say which is which in the README.
+
+### CONFIRMED 2026-08-22 at the Phase 0 gate — and it paid for itself twice
+
+The 10,000-vector fixture shipped as proposed (`scripts/make_fixture.py`), and the split held for the
+whole build: **113 tests — 80 C++ and 33 Python — run on small fixtures and finish in seconds, while
+SIFT1M appears only in `bench`.** Almost all of them use 3,000 vectors or fewer; the largest is a
+50,000-vector index built by one GIL test that needs the C++ work to dominate its own call overhead
+(B-14). Two things the split bought that were not the stated reason:
+
+- The Phase 1 gate on 10K is **exactly 1.0000**, while the same code on SIFT1M is 0.9995 against the
+  *published* ground truth. Having both numbers is what made it obvious the 0.9995 was a property of
+  the data rather than of the code (B-01's neighbourhood, resolved by `scripts/diagnose_recall.py`).
+  A 1M-only test suite would have presented that as an unexplained defect.
+- It is why 37/37 tests could run **under ASan+UBSan** at the Phase 2 gate. A sanitized build is
+  several times slower; a sanitized 1M test suite is a suite nobody runs, which is the same failure
+  D3 was written to avoid, one layer down.
+
+**GIST1M was not attempted.** Phase 2 did not land early, and §0.3's cut order outranks a stretch
+goal. It stays a stretch goal rather than becoming a limitation, because nothing in the repo claims
+a result at 960 dimensions.
 
 ---
 
@@ -226,7 +246,7 @@ implementation works, or not at all. Reading it while stuck converts a bug you w
 
 ---
 
-## D7 · EdgeRAG integration: three honest claims, not one convenient one · **PROPOSED** · 2026-08-21
+## D7 · EdgeRAG integration: three honest claims, not one convenient one · **ACCEPTED** · 2026-08-21 · **DELIVERED at Phase 6, 2026-08-27**
 
 **Decision.** The Phase 6.3 integration delivers:
 
@@ -260,9 +280,28 @@ criticism `WHAT_IS_THIS.md` §10 levels at other people.
 caller."* Designing the seam before the implementation existed, and then having the implementation
 drop in without changing a caller, is the whole argument for the abstraction.
 
+### DELIVERED 2026-08-27 — all three claims, and the crossover came in lower than guessed
+
+`python/veccore/edgerag.py` implements the protocol; `tests/test_edgerag_adapter.py` checks it
+against the real 650-query set. All three claims hold:
+
+1. **No regression** — same protocol, same call sites, recall at least as good as the TF-IDF index.
+2. **TF-IDF → BM25: +4.17% relative recall@5 at 11× lower latency**, quoted against the 0.3846
+   structural ceiling exactly as the honesty item above required.
+3. **Crossover measured at n ≈ 1,189** (`bench/crossover.py`), so EdgeRAG's 362 documents sit **3.3×
+   below it** and HNSW is **42% slower** there. `use_hnsw` therefore defaults to `False`.
+
+**The one thing worth flagging against this decision:** what shipped is a *drop-in that EdgeRAG has
+not yet adopted*. The adapter is here, tested against exported EdgeRAG data; EdgeRAG's own default
+retriever is still TF-IDF and its source still mentions VecCore only in the protocol docstring. So
+`02_VECCORE.md` §5's "swap VecCore into EdgeRAG; report the end-to-end delta" is delivered at the
+**retrieval** layer and not at the **pipeline** layer — there is no end-to-end answer-quality or
+token-cost number. That is a smaller claim than the spec's, it is the claim the measurements
+actually support, and it is named here rather than left for a reader to notice.
+
 ---
 
-## D8 · Coarse `shared_mutex` first; fine-grained locking described, not built · **PROPOSED** · 2026-08-21
+## D8 · Coarse `shared_mutex` first; fine-grained locking described, not built · **ACCEPTED** · 2026-08-21 · **REVISED then AMENDED 2026-08-26**
 
 **Decision.** One `std::shared_mutex` for the whole index. Readers take `shared_lock`, the inserter
 takes `unique_lock`. Be able to describe the finer-grained design — per-node link locks plus an
@@ -284,7 +323,7 @@ so it will not crash — and if the curve is unchanged, it was memory bandwidth 
 not the lock. A confident wrong explanation is worse than "I measured this and I am not certain
 why."
 
-### REVISED 2026-08-22 — measured, and P-30 fired exactly as predicted
+### REVISED 2026-08-26 — measured, and P-30 fired exactly as predicted
 
 **The lock is not the limiter, and the control proves it.** Read-only scaling with the lock
 *entirely removed* (`LockMode::None`) is indistinguishable from `shared_mutex` at every thread
@@ -309,7 +348,7 @@ saturates them — 8→12 threads buys 3.89→4.16× at 200k, almost nothing. Tu
 more cores engage is a third contributor and is not separated out here; saying so is more honest
 than attributing the whole residual to bandwidth.
 
-### AMENDED 2026-08-22 — the default lock mode changed, because the old one stops accepting writes
+### AMENDED 2026-08-26 — the default lock mode changed, because the old one stops accepting writes
 
 `LockMode::WriterPriority` is now the default, not `SharedMutex`. See **B-11**: glibc's
 `shared_mutex` is reader-preferring, so four continuous readers starve the writer *completely* —
@@ -363,7 +402,7 @@ the CPU *is* the device.
 
 ---
 
-## D12 · PQ is a memory result, not a speed result · **ACCEPTED** · 2026-08-22
+## D12 · PQ is a memory result, not a speed result · **ACCEPTED** · 2026-08-26
 
 **Measured on SIFT1M**, 1000 held-out queries, single thread:
 
@@ -394,7 +433,7 @@ estimate made before measuring; the code was never wrong. See `PLAN.md` §4.
 
 ---
 
-## D13 · Hybrid retrieval on EdgeRAG: BM25 ships, RRF is reported as a negative · **ACCEPTED** · 2026-08-22
+## D13 · Hybrid retrieval on EdgeRAG: BM25 ships, RRF is reported as a negative · **ACCEPTED** · 2026-08-26
 
 **Decision.** EdgeRAG's TF-IDF is replaced by BM25. RRF is implemented, tested, and **reported as a
 measured negative on this corpus** rather than quietly omitted or presented with a flattering
@@ -442,7 +481,7 @@ which is out of scope. The `+3-10% hybrid lift` in `02_VECCORE.md` §6's target 
 
 ---
 
-## D11 · No hand-written SIMD unless it is measured to matter · **PROPOSED** · 2026-08-21
+## D11 · No hand-written SIMD unless it is measured to matter · **ACCEPTED** · 2026-08-21 · **RESOLVED 2026-08-27**
 
 **Decision.** Compile `-O3 -march=native`, verify with `-fopt-info-vec-optimized` that the distance
 loop actually vectorised, and report that. Write AVX2 intrinsics only if a measurement shows the
@@ -460,16 +499,138 @@ to not spend a day on it.
 vectorised — most likely due to an aliasing assumption the compiler could not prove — then try
 `__restrict` first, and only then reach for intrinsics.
 
+### RESOLVED 2026-08-27 — measured. The loop vectorises, and AVX-512 is worth nothing here
+
+Run it yourself; the report is a build option, not a one-off:
+
+```bash
+cmake -S . -B ~/veccore-build-vecreport -G Ninja -DCMAKE_BUILD_TYPE=Release -DVECCORE_VEC_REPORT=ON
+cmake --build ~/veccore-build-vecreport --target veccore 2>&1 | grep distance.hpp
+```
+
+GCC 13.3.0, WSL2 Ubuntu 24.04, i5-11400H, `-O3 -march=native` — the same environment D10 requires of
+every other number in this repo:
+
+```
+include/veccore/distance.hpp:35:29: optimized: loop vectorized using 32 byte vectors
+include/veccore/distance.hpp:35:29: optimized: loop vectorized using 16 byte vectors
+```
+
+Line 35 is `L2Sqr`, and it is **the only distance line the library build reports** — which is itself
+worth reading correctly rather than glossing. `NegInnerProduct` does not appear because nothing in
+`libveccore.a` instantiates it in a hot loop; every index is built on squared L2 (D4). Compiling a
+translation unit that *does* instantiate it reports `distance.hpp:62:29` with an identical
+`32 byte vectors`, so both kernels vectorise — but only one of those two facts comes out of the
+build command above, and saying otherwise would be exactly the sort of one-line overclaim B-12 is
+about.
+
+The 32-byte and 16-byte entries are the main loop and its epilogue, not two competing results:
+32 bytes is 256 bits, so the body is AVX2, with a narrower tail for the remainder. The emitted
+assembly confirms it — `ymm` registers and `vfmadd`, and **`-fopt-info-vec-missed` reports nothing at
+all against either kernel**. `__restrict` was already on both kernels' parameters, so the aliasing
+escape hatch named above was never needed.
+
+**The interesting half is what the compiler declined to do.** `-march=native` resolves to
+`tigerlake`, and on this machine:
+
+```
+-mavx2 [enabled]   -mavx512f [enabled]   -mavx512vl [enabled]   -mprefer-vector-width= 256
+```
+
+The hardware has AVX-512 and **GCC deliberately caps the vector width at 256 bits anyway** — the
+licence-based downclocking this decision predicted, encoded as a compiler default. So the question
+"did the compiler leave something on the table?" has a directly testable form: force the wider
+width and measure. Same kernel, same data, 100,000 × 128-dim = 48.8 MiB (past this CPU's 12 MB L3,
+like the real scan), 7 trials each, interleaved A/B/A/B:
+
+| build | width chosen | `zmm` regs | median ns/distance, 3 runs |
+|---|---|---|---|
+| `-march=native` | 32 byte | 0 | 81.05 · 89.49 · 79.87 |
+| `-march=native -mprefer-vector-width=512` | 64 byte | 88 | 83.85 · 86.62 · 76.86 |
+
+**1.2% apart on the mean of the medians, against 13–43% spread within a single run.** The difference
+is an order of magnitude smaller than the noise: there is no effect here to measure, let alone one
+to hand-write intrinsics for. The reason is the same one Phase 5 arrived at from the other
+direction — at a working set that exceeds L3, this loop is **memory-bandwidth bound, not ALU
+bound**, and a wider multiply-add does not make the cache lines arrive faster. Widening the vector
+unit optimises the half of the loop that was never the constraint.
+
+**Decision stands, now on evidence rather than expectation: no hand-written AVX2.** The honest
+interview answer is the one this was written to earn — *"I checked the vectorisation report, both
+distance kernels were already AVX2+FMA with nothing missed, and I measured that forcing AVX-512 made
+no difference because the loop is bandwidth-bound"* — and it is a better answer than intrinsics
+would have been, because it comes with the measurement that says why.
+
+**Caveat on provenance, since D10 is strict about this:** the vectorisation report reproduces from
+the repo with the command above, but the A/B timing came from a standalone probe compiled against
+`include/veccore/distance.hpp`, not from `bench`, so **it has no record in `results/bench.jsonl`.**
+It is a compiler-configuration finding rather than an index benchmark, and it is labelled as one.
+
 ---
 
-## Decisions still open
+## D14 · Growth is the index's job, not the caller's · **ACCEPTED** · 2026-08-27
 
-| # | Question | Blocks | When it must be answered |
+**Decision.** `ConcurrentHnsw` gains a constructor over a **mutable** `VectorStore` and an
+`insert(const float*)` / `insert_batch(...)` pair that append to the store and link the new node into
+the graph **inside one exclusive section**. `HnswIndex` grows its own per-node arrays (`grow_to`) and
+`search` tops up an undersized `SearchScratch`. The original const-store constructor is untouched, so
+every existing caller keeps the smaller, cheaper contract.
+
+**Why this was not a binding-layer concern, which is where it looks like it belongs.**
+`VectorStore::add` appends to a `std::vector<float>`, so it **may reallocate**. Every concurrent
+reader is at that moment holding `const float*` into the old buffer — `search_layer` keeps one for
+the whole beam search. Moving that buffer under a live reader is a use-after-free that **does not
+crash**: it reads freed-but-still-mapped memory and returns k plausible, wrong neighbours. The append
+therefore has to happen where the exclusive lock already is, and the exclusive lock is private to
+`ConcurrentHnsw`.
+
+**Rejected: let the binding own the store and call `add()` then `insert(id)` itself.** The obvious
+shape, and it cannot be made safe from outside — the two steps are separately locked, so a reader can
+enter between them and observe a reallocated buffer. Two correct operations, composed, are not a
+correct operation.
+
+**Rejected: reserve capacity up front so `add` never reallocates.** Cheap, and it works right up
+until the caller exceeds the bound they guessed. The failure at that point is silent memory
+corruption rather than an error, which makes it the worst kind of "works in testing".
+
+**Rejected: make `HnswIndex` own its `VectorStore`.** This would make growth trivial and would
+reverse the ownership model the whole repo rests on (D5, and `PLAN.md` §3): the index borrows the
+data, which is what lets `bench` build several indexes over one 488 MB store without copying it.
+Paying a 488 MB copy per index to simplify one method is the wrong trade.
+
+**The part that was not obvious until TSan said so.** Growth does not only affect the code that
+grows. `grow_to` reallocates `levels_`, `links0_` and `upper_offset_` — buffers that had been
+fixed-size since construction for five phases, which made `ConcurrentHnsw::index()` handing out an
+unsynchronised reference to them *harmless in practice*. It stopped being harmless without being
+edited. That is B-13, and the fix is a set of locked accessors (`capacity`, `stats`, `graph_bytes`,
+`check_invariants`) with `index()` kept for the after-join case and documented as unsafe.
+
+**The same shape one level down:** a `SearchScratch` sized when the index held n nodes is a latent
+out-of-bounds read the moment it holds n+1, because `VisitedList` indexes without a bounds check —
+deliberately, since it is the hottest loop in the project. `search` now tops up an undersized scratch
+before using it. It is a caller-owned, thread-local object by contract (B-10), so that write races
+with nothing.
+
+**What this does not buy.** Inserts still serialise against each other and against all readers — one
+lock, coarse and correct (D8). Growth makes the index *incremental*, not *write-scalable*, and the
+README says so.
+
+---
+
+## Decisions ledger — closed
+
+**Nothing is open. All fourteen decisions are closed as of 2026-08-27**, and this table is kept as the
+ledger rather than deleted — a decision log that shows only the answers hides which questions were
+genuinely live and for how long.
+
+| # | Question | Blocked | Resolved |
 |---|---|---|---|
-| ~~D1~~ | ~~Schedule~~ | — | **Resolved 2026-08-21: Aug 25 hard stop** |
-| ~~D2~~ | ~~Build environment~~ | — | **Resolved 2026-08-21: WSL2 Ubuntu** |
-| ~~—~~ | ~~C++ ramp status~~ | — | **Resolved 2026-08-21: done; §0.5 does not apply** |
-| **D3** | SIFT10K fixture size — confirm at Phase 0 | Phase 1 tests | Phase 0 |
-| **D7** | Is the EdgeRAG integration still in scope if Phase 2 runs long? | Phase 6 | End of Aug 23 |
-| **D8** | Does concurrent *insert* ship, or only the read-scaling curve? | Phase 5 scope | Start of Phase 5 |
-| — | GIST1M as a second dataset? | Nothing — pure stretch | Only if Phase 2 lands early |
+| ~~D1~~ | ~~Schedule~~ | — | **2026-08-21: Aug 25 hard stop** (actual: Aug 22 / 26 / 27 — `PLAN.md` §0) |
+| ~~D2~~ | ~~Build environment~~ | — | **2026-08-21: WSL2 Ubuntu** |
+| ~~—~~ | ~~C++ ramp status~~ | — | **2026-08-21: done; §0.5 does not apply** |
+| ~~D3~~ | ~~SIFT10K fixture size — confirm at Phase 0~~ | Phase 1 tests | **2026-08-22: confirmed at 10,000.** 113 tests run in seconds; SIFT1M only in `bench` |
+| ~~D7~~ | ~~Is the EdgeRAG integration still in scope if Phase 2 runs long?~~ | Phase 6 | **2026-08-27: yes, all three claims shipped.** Crossover at n≈1,189; retrieval layer only, not end-to-end |
+| ~~D8~~ | ~~Does concurrent *insert* ship, or only the read-scaling curve?~~ | Phase 5 scope | **2026-08-26: insert shipped.** And it is the reason B-11 was found — a read-only curve would never have exposed the starvation |
+| ~~D11~~ | ~~Hand-written AVX2, or is the compiler already doing it?~~ | Nothing — pure stretch | **2026-08-27: not written.** Both kernels already AVX2+FMA, nothing missed, AVX-512 measured worthless |
+| ~~D14~~ | ~~Who owns growth when a Python caller adds to a live index?~~ | Phase 6 bindings | **2026-08-27: the index does.** Append and link happen under one exclusive section; B-13 is what the alternative would have cost |
+| — | GIST1M as a second dataset? | Nothing — pure stretch | **Not attempted.** Phase 2 did not land early; §0.3's cut order outranks a stretch goal |

@@ -1,0 +1,189 @@
+name: CI
+
+# What this is for, since a green badge on a portfolio repo is worth nothing by
+# itself: every claim in the README rests on tests that pass, sanitizers that
+# are clean, AND sanitizers that can be shown to fire. The last one is L-01's
+# lesson -- a clean ASan run proves nothing if ASan was never actually linked --
+# so both probe gates below assert the probe *fails*, and a green run means the
+# detector is real.
+#
+# Deliberately not here: benchmarks. SIFT1M is a 168 MB download and a
+# 19-minute single-threaded build, and a number measured on a shared runner of
+# unknown neighbours would violate D10's environment rule in the one place that
+# rule matters most. Correctness is portable; performance is not.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Release build, tests, and the Python module
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build
+          python -m pip install --upgrade pip
+          python -m pip install pybind11 numpy pytest
+
+      - name: Configure
+        # -march=native is safe here: the binary is built and run inside one job
+        # on one machine. It is switched OFF for wheels, where it would be a
+        # SIGILL on the first machine with a narrower ISA (see pyproject.toml).
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -Dpybind11_DIR="$(python -c 'import pybind11; print(pybind11.get_cmake_dir())')"
+
+      - name: Build
+        # -Wall -Wextra -Wpedantic -Wshadow are on for every target. The repo
+        # treats warning-clean as a hard requirement rather than an aspiration,
+        # so any warning printed here is a finding even though it is not fatal.
+        run: cmake --build build
+
+      - name: ctest
+        run: ctest --test-dir build --output-on-failure
+
+      - name: pytest against the built extension
+        env:
+          PYTHONPATH: ${{ github.workspace }}/python
+          # Without this, a module that cannot import _veccore calls
+          # pytest.skip(allow_module_level=True) and the job goes green having
+          # run nothing. Here, "not built" must be a failure.
+          VECCORE_REQUIRE_EXTENSION: "1"
+        run: python -m pytest tests/ -q
+
+  asan:
+    name: AddressSanitizer + UBSan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build
+
+      - name: Configure and build
+        # Debug implies ASan+UBSan (CMakeLists.txt). Python is off: a sanitized
+        # extension loaded by an unsanitized interpreter needs LD_PRELOAD
+        # gymnastics that prove nothing the C++ suite does not already cover.
+        run: |
+          cmake -S . -B build-asan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DVECCORE_BUILD_PYTHON=OFF
+          cmake --build build-asan
+
+      - name: Phase 0 gate -- asan_probe MUST abort
+        # The inverted assertion is the point. If this binary exits cleanly the
+        # sanitizers are not active, every "ASan clean" claim in the README is
+        # vacuous, and the build must fail loudly rather than pass quietly.
+        run: |
+          if ./build-asan/bin/asan_probe; then
+            echo "::error::asan_probe survived -- AddressSanitizer is NOT active (L-01)"
+            exit 1
+          fi
+          echo "asan_probe aborted as required; the sanitizer is real."
+
+      - name: ctest under ASan + UBSan
+        run: ctest --test-dir build-asan --output-on-failure
+
+  tsan:
+    name: ThreadSanitizer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build util-linux
+
+      - name: Configure and build
+        # A third, separate build: TSan and ASan cannot coexist. tests/CMakeLists.txt
+        # sets CROSSCOMPILING_EMULATOR to `setarch -R` for this configuration,
+        # which is what keeps both the build-time test enumeration and ctest from
+        # aborting on the shadow-memory/ASLR collision (L-09).
+        run: |
+          cmake -S . -B build-tsan -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DVECCORE_TSAN=ON \
+            -DVECCORE_BUILD_PYTHON=OFF
+          cmake --build build-tsan
+
+      - name: Phase 5 gate -- tsan_probe MUST report a race
+        # Same inverted logic as the ASan gate, and the same reason: the seven
+        # concurrency tests being clean means nothing unless TSan can be shown to
+        # fire on this build. tsan_probe calls the deliberately non-thread-safe
+        # search overload from four threads.
+        run: |
+          setarch -R ./build-tsan/bin/tsan_probe > tsan_probe.log 2>&1 || true
+          if grep -q "WARNING: ThreadSanitizer" tsan_probe.log; then
+            echo "tsan_probe reported the expected race; the sanitizer is real."
+          else
+            echo "::error::tsan_probe reported no race -- ThreadSanitizer is NOT active (L-09)"
+            cat tsan_probe.log
+            exit 1
+          fi
+
+      - name: ctest under TSan
+        run: ctest --test-dir build-tsan --output-on-failure
+
+  wheel:
+    name: pip install
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build and install the wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+
+      - name: Import from outside the source tree
+        # From /tmp on purpose. Run inside the repo, `import veccore` can pick up
+        # ./python/veccore and pass while the *installed* package is broken --
+        # which is exactly how a wheel that packaged the .py files and no
+        # extension shipped without anyone noticing.
+        working-directory: /tmp
+        run: |
+          python -m pip install numpy
+          python - <<'PY'
+          import numpy as np
+          import veccore
+
+          print("imported:", veccore.__file__)
+          rng = np.random.default_rng(0)
+          x = rng.random((600, 16), dtype=np.float32)
+
+          index = veccore.HnswIndex(x[:400], M=16, ef_construction=100)
+          index.add_batch(x[400:])
+          assert index.size == 600, index.size
+          assert index.check_invariants() == ""
+
+          ids, dists = index.search(x[500], k=1, ef_search=64)
+          assert ids[0] == 500, ids[0]
+
+          pq = veccore.PqIndex(x, m=4, train_size=600, seed=1)
+          assert pq.compression_ratio == 16.0, pq.compression_ratio
+          print("installed package works")
+          PY

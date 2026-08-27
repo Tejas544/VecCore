@@ -28,6 +28,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstdint>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -44,7 +45,8 @@ namespace {
 
 struct Args {
     std::string tag = "flat";
-    std::string index = "flat";          // flat | hnsw | pq | threads
+    std::string index = "flat";          // flat | hnsw | pq | threads | persist
+    std::string persist_path;            // --index persist: where to write the .vci
     std::string out = "results/bench.jsonl";
     std::string base, query, truth;
     std::size_t k = 10;
@@ -111,7 +113,7 @@ Args parse(int argc, char** argv) {
             return argv[++i];
         };
         if      (arg == "--tag")             a.tag = next("a value");
-        else if (arg == "--index")           a.index = next("flat|hnsw|pq|threads");
+        else if (arg == "--index")           a.index = next("flat|hnsw|pq|threads|persist");
         else if (arg == "--out")             a.out = next("a path");
         else if (arg == "--base")            a.base = next("a path");
         else if (arg == "--query")           a.query = next("a path");
@@ -223,7 +225,7 @@ int main(int argc, char** argv) {
         return args.help ? 0 : 2;
     }
     if (args.index != "flat" && args.index != "hnsw" && args.index != "pq" &&
-        args.index != "threads") {
+        args.index != "threads" && args.index != "persist") {
         std::cerr << "bench: --index must be flat, hnsw, pq or threads\n";
         return 2;
     }
@@ -391,6 +393,104 @@ int main(int argc, char** argv) {
             write_record(m, p);
         }
         std::cout << "\n  peak RSS   : " << peak_rss_mib() << " MiB\n";
+    }
+
+    // ---- persistence -------------------------------------------------------
+    // The whole argument for save/load is a ratio, so measure both sides in one
+    // process on one machine: build once, save, load, and prove the loaded index
+    // answers identically before reporting the timings. A load that is fast and
+    // wrong is not a result.
+    if (args.index == "persist") {
+        HnswParams hp;
+        hp.M = args.M;
+        hp.ef_construction = args.ef_construction;
+        hp.seed = args.seed;
+
+        std::cout << "  building M=" << hp.M << " ef_construction=" << hp.ef_construction
+                  << " seed=" << hp.seed << " ...\n";
+        HnswIndex index(base, hp);
+        const auto t_build = Clock::now();
+        index.build();
+        const double build_ms = ms_since(t_build);
+        std::cout << "  built in   : " << build_ms / 1000.0 << " s\n";
+
+        const std::string path = args.persist_path.empty()
+                                     ? std::string("/tmp/veccore_bench_index.vci")
+                                     : args.persist_path;
+
+        const auto t_save = Clock::now();
+        index.save(path);
+        const double save_ms = ms_since(t_save);
+
+        std::uintmax_t file_bytes = 0;
+        {
+            std::ifstream f(path, std::ios::binary | std::ios::ate);
+            if (f) file_bytes = static_cast<std::uintmax_t>(f.tellg());
+        }
+
+        VectorStore loaded_store;
+        // Named t_reload/reload_ms rather than t_load/load_ms: those already
+        // exist at function scope for the *dataset* load, and -Wshadow is on.
+        const auto t_reload = Clock::now();
+        HnswIndex loaded = HnswIndex::load(path, loaded_store);
+        const double reload_ms = ms_since(t_reload);
+
+        // Equivalence before timing. A save/load that silently drops the RNG
+        // state or misreads an array would still be fast, and "we made restart
+        // 200x cheaper" would be a claim about a broken index.
+        const std::size_t ef_check = args.ef_search.empty() ? 64 : args.ef_search.front();
+        std::size_t compared = 0, mismatches = 0;
+        {
+            SearchScratch sa = index.make_scratch();
+            SearchScratch sb = loaded.make_scratch();
+            for (vec_id_t q = 0; q < queries.size(); ++q) {
+                const auto a = index.search(queries.at(q), args.k, ef_check, sa);
+                const auto b = loaded.search(queries.at(q), args.k, ef_check, sb);
+                if (a.size() != b.size()) { ++mismatches; continue; }
+                for (std::size_t i = 0; i < a.size(); ++i) {
+                    ++compared;
+                    if (a[i].id != b[i].id) ++mismatches;
+                }
+            }
+        }
+
+        const std::string invariants = loaded.check_invariants();
+        const bool identical = (mismatches == 0) && invariants.empty();
+
+        std::cout << "  save       : " << save_ms / 1000.0 << " s\n"
+                  << "  load       : " << reload_ms / 1000.0 << " s\n"
+                  << "  file       : " << static_cast<double>(file_bytes) / (1024.0 * 1024.0)
+                  << " MiB\n"
+                  << "  rebuild/load: " << (reload_ms > 0 ? build_ms / reload_ms : 0.0) << "x\n"
+                  << "  identical  : " << (identical ? "yes" : "NO") << "  (" << compared
+                  << " results compared, " << mismatches << " mismatched)\n";
+        if (!invariants.empty()) std::cout << "  invariants : " << invariants << "\n";
+
+        json::Object p;
+        p.str("kind", "persist")
+         .num("M", static_cast<long long>(hp.M))
+         .num("ef_construction", static_cast<long long>(hp.ef_construction))
+         .num("ef_search", static_cast<long long>(ef_check))
+         .num("seed", static_cast<long long>(hp.seed))
+         .num("graph_bytes", static_cast<long long>(index.graph_bytes()))
+         .num("vector_bytes", static_cast<long long>(base.bytes()));
+        json::Object m;
+        m.num("build_ms", build_ms)
+         .num("save_ms", save_ms)
+         .num("load_ms", reload_ms)
+         .num("file_bytes", static_cast<long long>(file_bytes))
+         .num("rebuild_over_load", reload_ms > 0 ? build_ms / reload_ms : 0.0)
+         .num("results_compared", static_cast<long long>(compared))
+         .num("results_mismatched", static_cast<long long>(mismatches))
+         .num("index_bytes", static_cast<long long>(index.graph_bytes() + base.bytes()));
+        write_record(m, p);
+
+        std::cout << "\n  peak RSS   : " << peak_rss_mib() << " MiB\n";
+        if (!identical) {
+            std::cerr << "bench: the loaded index does not match the original -- "
+                         "not writing this off as a timing result\n";
+            return 1;
+        }
     }
 
     // ---- product quantization ---------------------------------------------
