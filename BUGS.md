@@ -197,6 +197,73 @@ explicitly, and nothing in the tooling was going to remind anyone.
 
 ---
 
+### B-03 · The trust check counted the harness's own output as a code change · 2026-08-22 · Phase 1
+
+> **⚠️ This entry is incomplete on purpose. Two fields below are marked `TODO` because only the
+> person who debugged it can fill them, and inventing them would make this the one reconstructed
+> entry in a file whose whole value is that it is not reconstructed.** Everything else is taken from
+> commit `28ff358` and the code as it stands.
+
+**Symptom:** `bench` wrote a record on its first run and then refused on the second:
+
+```
+NOT PUBLISHABLE: working tree is dirty
+bench: refusing to write a record from an untrusted build.
+```
+
+Nothing in the source had been touched between the two runs. **The harness invalidated its own
+trust condition by doing its job**: `bench` appends to `results/bench.jsonl`, that append dirties
+the working tree, and the dirty tree is what the next run's trust check rejects.
+
+**Wrong theory:** *TODO — what you believed first, and why it was plausible.* The candidates worth
+checking your memory against: an editor writing a swap or backup file; a line-ending change from
+editing on Windows and running under WSL (L-06's neighbourhood, and it had just been fixed, which
+makes it exactly the kind of thing you suspect twice); or the trust check itself being over-strict
+rather than mis-scoped. This is the most interesting field in the entry and it is the one that
+cannot be recovered from `git log`.
+
+**Root cause:** the dirty check ran `git status --porcelain` over the **whole** tree, so it counted
+`results/bench.jsonl` — an output — as if it were an input. The claim `trusted` makes is *"this
+binary was built from commit X."* A modified **source** file falsifies that claim. An appended
+**results** file does not.
+
+The failure mode is worse than an annoyance and is why the class is *unreproducible by
+construction*: the obvious workaround is `--allow-untrusted`, which stamps `trusted: false` into the
+record and would have quietly demoted every subsequent measurement in the project. The second-most
+obvious is committing the results file before each run, which makes the SHA in the record point at a
+commit that does not contain the code that produced it. Both "fixes" break provenance while making
+the error message go away.
+
+**Diagnosis:** *TODO — the method, not the answer.* What was the step that separated "the tree is
+dirty" from "the tree is dirty **because of us**"? Most likely running `git status --porcelain` by
+hand and reading the one line it printed — but write what actually happened, including if it was
+slower than that.
+
+**Fix:** `28ff358`. One pathspec on the dirty check:
+
+```cpp
+const CmdResult status = run(git + "status --porcelain -- ':!results'");
+```
+
+with the reasoning inline in `src/stamp.cpp`, because a future reader deleting that pathspec to
+"tighten" the check would reintroduce it exactly.
+
+**Prevention:** **none, and that is a real gap.** `tests/test_smoke.cpp` covers the trust *logic* —
+that a sanitized or dirty build is never publishable — but nothing pins the **scope** of the dirty
+check, so a change to that pathspec would pass every test in the repo. The test that should exist:
+initialise a scratch repo, commit, append a line to `results/`, and assert `capture_env` still
+reports `git_dirty == false`; then touch a source file and assert it flips to `true`.
+
+**Cost:** ~5 minutes.
+
+**Why a five-minute bug is worth an entry.** It is the only bug here where **the measurement
+apparatus broke its own precondition**, and where all three obvious workarounds silently destroy the
+property the apparatus exists to guarantee. D10 says a record without provenance does not go in a
+plot; B-03 is the case where the fastest way past an error message would have made every record in
+`results/` untrustworthy while leaving every plot looking exactly the same.
+
+---
+
 ### B-04 · bench reported a recall number that could not mean anything · 2026-08-22 · Phase 1
 
 **Symptom:** `--max-base 200000 --truth sift_groundtruth.ivecs` printed `recall@10 0.253`, three
@@ -1264,7 +1331,7 @@ anticipate — those are the most valuable entries in the whole document, becaus
 that prove the log is real rather than reconstructed.
 
 **What the shape of this table actually says.** 36 failure modes were pre-registered and **3 were
-hit**, while **12 of the 15 logged entries were novel** — so the register's value was not its
+hit**, while **13 of the 16 logged entries were novel** — so the register's value was not its
 accuracy. Phase 2 is the clearest case: 11 predictions, the widest error bar in `PLAN.md`, and **zero
 hits and one trivial novel bug**, because §2.7's ordered verification meant every prediction was
 being actively checked for rather than waited for. The predictions that "missed" were mostly

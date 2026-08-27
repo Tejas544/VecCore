@@ -649,22 +649,71 @@ blank filled from a JSON record in `results/`, none from memory.
 
 ## 7. Definition of done
 
-Ordered by what an interviewer checks first.
+Ordered by what an interviewer checks first. **Ticked against evidence, not against memory** —
+every ✅ below names the artifact that proves it, and the three items that are *not* clean ticks say
+so rather than rounding up. A checklist that is all ✅ because someone went through and ticked it is
+worth nothing; the two ⚠️ rows are the ones that make the rest of the column mean something.
 
-- [ ] **HNSW recall@10 ≥ 0.95** on SIFT1M, verified against brute-force ground truth
-- [ ] **recall/QPS curve** from an `ef_search` sweep, ann-benchmarks format
-- [ ] **FAISS head-to-head**, same machine, same data, matched thread count, interleaved
-- [ ] **PQ Pareto plot**, compression ratios always quoted with their recall
-- [ ] **BM25 + RRF** with the hybrid lift measured against both single-signal baselines
-- [ ] **Thread-scaling curve** with the 6-core/12-thread shape explained
-- [ ] **pybind11 module** importable from EdgeRAG's venv, GIL released
-- [ ] **EdgeRAG integration**: no-regression drop-in, BM25 quality delta, crossover plot
-- [ ] `BUGS.md` with **real entries**, including one you can tell as a story for five minutes
-- [ ] `CONTEXT.md` with every decision and its rejected alternative
-- [ ] README: diagram, table, ≥4 plots, limitations, reproduction steps
-- [ ] `-Wall -Wextra` clean; ASan + UBSan clean; TSan clean if Phase 5 shipped
-- [ ] Commits spread across every day of the build, not one bulk push
-- [ ] You can answer all 19 questions in `02_VECCORE.md` §7 cold
+- [x] **HNSW recall@10 ≥ 0.95** on SIFT1M, verified against brute-force ground truth
+      — **0.9755** @ ef=80, against the published ground truth. `results/bench.jsonl`, tag
+      `hnsw_sift1m_M16`.
+- [x] **recall/QPS curve** from an `ef_search` sweep, ann-benchmarks format
+      — `docs/plots/recall_qps.png`, six points, monotone across the whole sweep.
+- [x] **FAISS head-to-head**, same machine, same data, matched thread count, interleaved
+      — `docs/plots/head_to_head.md`, generated from paired records. Recall within 0.002 at every
+      `ef_search`; `faiss.omp_set_num_threads(1)` set explicitly (P-32).
+- [x] **PQ Pareto plot**, compression ratios always quoted with their recall
+      — `docs/plots/pq_pareto.png`. `bench` records code bytes, codebook bytes and total footprint
+      as separate fields so a reranking configuration cannot be quoted at 64×.
+- [x] **BM25 + RRF** with the hybrid lift measured against both single-signal baselines
+      — measured, and **the RRF result is negative** (0.1862 vs BM25's 0.1923). Reported with the
+      oracle that says how much was on the table, per §4.5's pre-commitment. B-08.
+- [x] **Thread-scaling curve** with the 6-core/12-thread shape explained
+      — `docs/plots/thread_scaling.png`, in-cache and out-of-cache curves, with a lock-removed
+      control proving the lock is *not* the limiter (P-30).
+- [ ] ⚠️ **pybind11 module** importable from EdgeRAG's venv, GIL released
+      — **GIL released: yes**, and proven from Python (`tests/test_bindings.py`, 4 threads at 1.35×
+      for 4× the work). **"From EdgeRAG's venv": no, and it cannot be.** EdgeRAG's venv is a
+      *Windows* venv (`.venv/Scripts/python.exe`); the extension is a Linux `.so`, because D2 made
+      this project Linux-only on purpose (ASan, TSan, valgrind, a clean pybind11 story). The
+      integration runs with both projects under one WSL interpreter, which is how D30's numbers were
+      produced — but that is a different sentence from the one this line wrote in advance, and
+      ticking it would be the exact overclaim B-12 is an entry about. **This item was unachievable
+      as written from the moment D2 was accepted, and neither noticed until now.**
+- [x] **EdgeRAG integration**: no-regression drop-in, BM25 quality delta, crossover plot
+      — all three, and the drop-in is **landed in EdgeRAG's own tree** rather than described:
+      `edgerag/retrieval/veccore_index.py`, `build_index(kind="veccore")`, no call site changed.
+      BM25 beats TF-IDF at every cutoff on 650 real queries, measured by EdgeRAG's own `recall_at_k`
+      (EdgeRAG D30). Crossover at n≈1,189, `docs/plots/crossover.png`.
+- [x] `BUGS.md` with **real entries**, including one you can tell as a story for five minutes
+      — 15 confirmed entries and 9 defused landmines. The five-minute story is **B-11**: four
+      readers stop the index accepting writes, because glibc's `shared_mutex` is reader-preferring
+      and a vector index is the canonical many-readers-occasional-writer workload.
+- [x] `CONTEXT.md` with every decision and its rejected alternative
+      — 15 decisions, all closed, three of them revised under measurement (D5, D8, D12).
+- [x] README: diagram, table, ≥4 plots, limitations, reproduction steps
+      — Mermaid architecture diagram, generated benchmark tables, **7 plots**, a limitations section
+      written before the code, and per-section reproduction commands.
+- [x] `-Wall -Wextra` clean; ASan + UBSan clean; TSan clean if Phase 5 shipped
+      — all three, on every push: **95 C++ tests and 45 Python tests green under Release, ASan+UBSan
+      and TSan in CI**, with the two probe gates asserting the sanitizers actually *fire*.
+- [ ] ⚠️ **Commits spread across every day of the build, not one bulk push**
+      — **39 commits across three days** (18 on Aug 22, 14 on Aug 26, 7 on Aug 27), against a
+      window §0 planned as Aug 21–25. Not one bulk push, and not "every day" either. The intent
+      behind this line — that the history shows the work happening rather than being staged — is
+      met; the literal wording is not, and `git log` is the thing a reader checks.
+- [ ] **You can answer all 19 questions in `02_VECCORE.md` §7 cold**
+      — **Yours to assess, and deliberately left unticked.** Nothing in this repository is evidence
+      for it, so a tick here would be the only claim in the file with no artifact behind it. The
+      material exists — `CONTEXT.md` for the design questions, `BUGS.md` for the debugging ones, and
+      D11/D5/D8 for the three that expect a measurement — but reading them is not the same as
+      answering cold, and this checklist does not get to decide that.
+
+**Where that leaves it: 11 of 14 clean, two honest partials, one self-assessment.** The two partials
+are both cases where a line written on Aug 21 stopped being achievable as worded — one because D2
+made the project Linux-only, one because the schedule compressed to three working days — and neither
+was noticed until this file was audited against reality. That is itself the argument for auditing a
+checklist instead of ticking it.
 
 ---
 
