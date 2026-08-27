@@ -6,6 +6,14 @@
 **Window actual:** **Aug 22, Aug 26, Aug 27 — three working days**, not the four contiguous ones §0.1
 costed. Phases 0–2 landed Aug 22, Phases 3–5 on Aug 26, Phase 6 on Aug 27.
 
+**Work after the gates, and why it is listed as such.** Three things landed after Phase 6 closed on
+Aug 27 and are *not* part of the six-phase plan: the Python bindings for incremental insert and PQ,
+**persistence** (`save`/`load`, `CONTEXT.md` D15), and **landing the VecCore swap inside EdgeRAG**
+with a measured retrieval delta (`CONTEXT.md` D14, EdgeRAG's D30). They are recorded here rather
+than folded into a gate, because a phase gate that grows after it is declared green is not a gate.
+The scorecard in `BUGS.md` carries them as Phase 7 with a zero in the *Predicted* column — nothing
+was pre-registered for work the plan never scoped, and B-15 is what that cost.
+
 §0.1 is left exactly as written. It is the record of a decision made with the information available
 on Aug 21, not a forecast to be quietly corrected once the outcome is known — and the gap between
 the two is itself the useful part. Every gate date in §4 and every entry date in `BUGS.md` is the

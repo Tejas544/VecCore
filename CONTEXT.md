@@ -119,7 +119,7 @@ realistic dimensionality, not realistic structure. Say which is which in the REA
 ### CONFIRMED 2026-08-22 at the Phase 0 gate — and it paid for itself twice
 
 The 10,000-vector fixture shipped as proposed (`scripts/make_fixture.py`), and the split held for the
-whole build: **113 tests — 80 C++ and 33 Python — run on small fixtures and finish in seconds, while
+whole build: **140 tests — 95 C++ and 45 Python — run on small fixtures and finish in seconds, while
 SIFT1M appears only in `bench`.** Almost all of them use 3,000 vectors or fewer; the largest is a
 50,000-vector index built by one GIL test that needs the C++ work to dominate its own call overhead
 (B-14). Two things the split bought that were not the stated reason:
@@ -617,9 +617,82 @@ README says so.
 
 ---
 
+## D15 · An index that cannot be saved is an index you rebuild every morning · **ACCEPTED** · 2026-08-27
+
+**Decision.** `HnswIndex` and `ProductQuantizer` get `save`/`load` over a versioned, checksummed
+binary format (`include/veccore/serialize.hpp`), exposed through the bindings. HNSW files are
+**self-contained** — vectors included. PQ files are **not** — codes and codebooks only.
+
+**Why at all, in one number each.** Building the SIFT1M graph takes **1,139 s**; training PQ
+codebooks takes **86.5 s**. Both are pure recomputation of something deterministic. Until this
+existed, every restart paid them again, which is the difference between a benchmark and something
+a process can actually use.
+
+### The format, and the four ways a binary dump corrupts data without erroring
+
+Writing `reinterpret_cast<const char*>(v.data())` to a file is three lines and works until it does
+not. Every header field exists for a specific silent failure:
+
+| Failure | Defence | What it looks like without one |
+|---|---|---|
+| Wrong file entirely | `MAGIC`, checked first | a graph of garbage ids that still returns k results |
+| Format drift between versions | `VERSION`, exact match | every field after the changed one misparses; recall just gets worse |
+| Different machine | endian probe + `sizeof` fields | the same bytes mean different numbers; distances are wrong |
+| Truncated or corrupted write | FNV-1a checksum, length guards, no-trailing-bytes | a file interrupted at 90% whose header parses cleanly |
+
+**Only the first has an obvious symptom.** The other three produce *plausible* indexes, which on
+this project means quietly wrong recall — the same class as B-01, B-07 and P-04. That asymmetry is
+the whole argument for a header rather than a raw dump.
+
+**Rejected: portability across architectures.** The format is native-endian and native-width. Making
+it portable means byte-swapping every float on read, which costs real time on a 488 MB store to
+serve a use case — moving an index from x86 to a big-endian machine — that does not exist here. The
+claim made is that a mismatch is **detected**, not that it works. *"I detect it and refuse"* is a
+defensible position; silently producing wrong distances is not.
+
+**Rejected: a text or JSON format.** Human-readable is worth a lot for a config file and nothing for
+629 MB of adjacency lists, where it would cost an order of magnitude in size and parse time.
+
+**Rejected: no version field, on the grounds that there is only one version.** There is always
+exactly one version until there are two, and the transition is the moment you need the field you
+did not write. It costs four bytes.
+
+### Two asymmetries that are deliberate
+
+**HNSW saves its vectors; PQ does not.** A graph is a list of ids — without the vectors it indexes
+nothing, and re-attaching it to a store the caller supplies requires proving that store is the right
+one, which cannot be done cheaply. So HNSW files are self-contained at 629 MB for SIFT1M. PQ is the
+opposite case: the **codes are the compressed form**, 30.6 MiB at m=32 against 488 MiB of vectors,
+and writing the vectors beside them would inflate the artifact 16x to carry data that only
+`search_rerank` needs. A loaded quantizer therefore searches immediately and reranks only if the
+caller passes a store — which is already what that method's signature demands.
+
+**The RNG state travels with the file.** Level assignment is a random draw, so an index whose
+generator restarts after a load diverges from one that never stopped — silently, and only for nodes
+inserted afterwards. Dropping it would reintroduce P-03 (an unseeded RNG making results
+unreproducible) one level down, in a place nobody would think to look. `std::mt19937_64` has a
+standard stream representation, so this is portable across libstdc++ versions in a way that
+`memcpy`-ing the state would not be. `test_serialize.cpp` asserts the property directly: build,
+save, load, insert 200 more, and the graph must match one that was never saved.
+
+### What it cost to get right
+
+**B-15**, and it is worth reading because the bug is in the layer this decision did not think about.
+`HnswIndex::load` takes the store as an out-parameter precisely so the index can borrow it — and the
+doc comment explains that a self-contained `{store; index;}` struct would dangle when moved. Then
+`PyHnsw::load` returned by value, and `PyHnsw` **is** that struct. Wrong neighbours first, then a
+segfault. A comment on the C++ API does not protect the binding that wraps it; deleted move
+constructors do.
+
+**Measured, on SIFT1M with 1,000 queries:** see the README's persistence table. The equivalence
+check is not optional and `bench --index persist` refuses to report timings without it — a load that
+is fast and wrong is not a result.
+
+---
+
 ## Decisions ledger — closed
 
-**Nothing is open. All fourteen decisions are closed as of 2026-08-27**, and this table is kept as the
+**Nothing is open. All fifteen decisions are closed as of 2026-08-27**, and this table is kept as the
 ledger rather than deleted — a decision log that shows only the answers hides which questions were
 genuinely live and for how long.
 
@@ -628,9 +701,10 @@ genuinely live and for how long.
 | ~~D1~~ | ~~Schedule~~ | — | **2026-08-21: Aug 25 hard stop** (actual: Aug 22 / 26 / 27 — `PLAN.md` §0) |
 | ~~D2~~ | ~~Build environment~~ | — | **2026-08-21: WSL2 Ubuntu** |
 | ~~—~~ | ~~C++ ramp status~~ | — | **2026-08-21: done; §0.5 does not apply** |
-| ~~D3~~ | ~~SIFT10K fixture size — confirm at Phase 0~~ | Phase 1 tests | **2026-08-22: confirmed at 10,000.** 113 tests run in seconds; SIFT1M only in `bench` |
+| ~~D3~~ | ~~SIFT10K fixture size — confirm at Phase 0~~ | Phase 1 tests | **2026-08-22: confirmed at 10,000.** 140 tests run in seconds; SIFT1M only in `bench` |
 | ~~D7~~ | ~~Is the EdgeRAG integration still in scope if Phase 2 runs long?~~ | Phase 6 | **2026-08-27: yes, all three claims shipped.** Crossover at n≈1,189; retrieval layer only, not end-to-end |
 | ~~D8~~ | ~~Does concurrent *insert* ship, or only the read-scaling curve?~~ | Phase 5 scope | **2026-08-26: insert shipped.** And it is the reason B-11 was found — a read-only curve would never have exposed the starvation |
 | ~~D11~~ | ~~Hand-written AVX2, or is the compiler already doing it?~~ | Nothing — pure stretch | **2026-08-27: not written.** Both kernels already AVX2+FMA, nothing missed, AVX-512 measured worthless |
 | ~~D14~~ | ~~Who owns growth when a Python caller adds to a live index?~~ | Phase 6 bindings | **2026-08-27: the index does.** Append and link happen under one exclusive section; B-13 is what the alternative would have cost |
+| ~~D15~~ | ~~Does an index that cannot be persisted count as usable?~~ | Phase 7 | **2026-08-27: no.** save/load over a versioned, checksummed format; HNSW self-contained, PQ codes-only |
 | — | GIST1M as a second dataset? | Nothing — pure stretch | **Not attempted.** Phase 2 did not land early; §0.3's cut order outranks a stretch goal |

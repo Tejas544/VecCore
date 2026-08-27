@@ -69,6 +69,7 @@ the code rather than the test.
 | B-12 | An unmeasured number in the *limitations* section, overstating our own gap 7× | baseline mismatch | ~5 min |
 | B-13 | A locked class handed out an unlocked reference; growth turned it into a real race | data race | ~25 min |
 | B-14 | A GIL test measured the binding's own marshalling cost, not the GIL | measurement that measured nothing | ~20 min |
+| B-15 | The binding moved a store out from under the reference its index holds | uninitialised / undefined behaviour | ~20 min |
 
 **Phase 0 scorecard:** 7 landmines defused, 0 confirmed bugs, ~1.5 h. Four of the seven
 (L-01, L-02, L-05, L-06) were found by checking a tool *before* depending on it rather than after.
@@ -720,6 +721,68 @@ does not move when you change the thing it is supposedly measuring.
 
 ---
 
+### B-15 · The binding built the exact hazard the API it wraps warns about · 2026-08-27 · Phase 7
+
+**Symptom:** two failures in a row from the new persistence tests, and they looked unrelated:
+
+```
+test_saved_index_reloads_with_identical_answers  FAILED  (wrong neighbour ids)
+test_saved_index_carries_its_vectors             Fatal Python error: Segmentation fault
+```
+
+The C++ round-trip tests — the same operation, one layer down — were 95/95 green under Release,
+ASan **and** TSan. So the format was fine and the binding was not.
+
+**Wrong theory:** that `HnswIndex::load` was mis-reading an array in a way ASan happened not to
+catch, because the first symptom was *wrong answers* rather than a crash and that is what a
+misparsed adjacency list looks like. I re-read the field order in `serialize.cpp` twice before
+noticing that the C++ tests exercise that exact path and pass.
+
+**Root cause:** `PyHnsw::load` returned `PyHnsw` **by value**.
+
+`PyHnsw` owns `VectorStore store_` as a member, and the `ConcurrentHnsw` it holds contains an
+`HnswIndex` whose `store_` is a `const VectorStore&` pointing at that member. Returning by value
+moves the `PyHnsw` — the store's bytes relocate — while the reference keeps pointing at the address
+the temporary used to occupy. Every subsequent search reads freed stack memory: sometimes stale but
+mapped, which gives plausible wrong neighbours, and sometimes unmapped, which gives a segfault. Two
+symptoms, one cause, and the order they appeared in was pure luck.
+
+**The part worth keeping.** `HnswIndex::load`'s own doc comment, written about an hour earlier in
+the same session, says:
+
+> The vectors are loaded into `store_out`, which the **caller owns** and must outlive the returned
+> index [...] A self-contained `LoadedIndex { store; index; }` would be a nicer signature and an
+> unsafe one: the index holds a reference into the store, so moving that struct would dangle it.
+
+Then the binding was written, and `PyHnsw` **is** that struct. I designed the C++ API specifically to
+make this unrepresentable, documented why, and reproduced it one layer up inside the hour — because
+at the binding layer it does not look like a lifetime question at all. It looks like "return the
+object you just built", which is what you write in every other language.
+
+**Diagnosis:** the two C++ suites passing is what located it. A bug that reproduces through the
+binding and not through the library it wraps is in the binding, and that halves the search space
+before you have read any code. The value/reference distinction was then the only thing in
+`PyHnsw::load` that differed from `PyHnsw`'s constructor, which pybind11 builds in place.
+
+**Fix:** `load` returns `std::unique_ptr<PyHnsw>`, so the object is heap-allocated and its address
+is fixed regardless of what happens to the handle. Copy and move are then **deleted** on `PyHnsw`,
+which is the actual repair — the compiler now rejects the shape rather than trusting the next person
+to remember. Two lines of prevention against a comment that had already failed to prevent it once.
+
+**Prevention:** the deleted move constructor, plus `test_saved_index_carries_its_vectors`, which
+searches for a known vector and requires distance zero. An index pointing at freed memory returns
+`k` ids in range and a full result set; it does not return distance zero for a vector it holds.
+
+**Cost:** ~20 minutes.
+
+**The general lesson, which is why this gets a full entry for a 20-minute bug.** Documenting a
+hazard on the API that has it does not protect the API that *wraps* it. The C++ signature forces the
+caller to own the store; pybind11's job is to hide exactly that kind of ceremony from Python, so the
+binding layer is where an ownership constraint is most likely to be quietly dropped — by the person
+who wrote the constraint. **A comment is not an invariant. Deleted constructors are.**
+
+---
+
 ## Defused landmines
 
 ### L-09 · ThreadSanitizer aborts at startup on this kernel unless ASLR is off · 2026-08-26 · Phase 5
@@ -1182,7 +1245,8 @@ are preparing answers in December.
 | 4 · BM25 + RRF | 4 · P-08, P-25…P-27 | 0 | 1 · B-09 *(+ B-08, a null result, not a bug)* | ~0.6 |
 | 5 · Concurrency | 4 · P-28…P-31 | **1** · P-30 (the confident wrong explanation) | 3 · B-10, B-11, L-09 | ~1.1 |
 | 6 · Bindings + baseline | 5 · P-32…P-36 | **1** · P-35 (the GIL, from the other side) | 3 · B-12, B-13, B-14 | ~0.9 |
-| **Total** | **36** | **3** | **12** | **~5.7 h** |
+| 7 · Persistence + the EdgeRAG swap | 0 — *nothing was pre-registered* | 0 | 1 · B-15 | ~0.3 |
+| **Total** | **36** | **3** | **13** | **~6.0 h** |
 
 Plus **two out-of-phase class hits**, which are the most interesting cells in the table and do not
 fit a column: **B-01** is P-04's failure class (comparator polarity) firing in Phase 1's `TopK`
@@ -1207,6 +1271,13 @@ being actively checked for rather than waited for. The predictions that "missed"
 converted into guards before they could fire, which is the outcome you want and the one that makes a
 bug log look thin. The phases with real novelty — 1, 3, 5 and 6 — are the ones where something was
 being measured for the first time rather than transcribed from a paper.
+
+**Phase 7 has a zero in the Predicted column, and that is the most honest cell in the table.**
+Persistence was not in `PLAN.md` at all — it was added after every gate was green, so no failure
+mode was pre-registered for it and the register could not help. What it produced instead was B-15,
+where a hazard *was* documented — in the doc comment of the very function being wrapped — and got
+rebuilt one layer up inside the hour. Pre-registration works because it is read before you write the
+code; a comment on an adjacent API is not read at all.
 
 **Phase 6 grew after the gate, and the count above reflects that.** Exposing incremental insert and
 PQ through the bindings produced B-13 and B-14 on its own, which is the honest argument against

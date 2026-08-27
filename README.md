@@ -8,9 +8,11 @@ written from scratch in C++17 and benchmarked against FAISS.**
 
 > **Status: complete.** All six phases shipped and gated. HNSW, Product Quantization, BM25+RRF
 > and concurrent search, benchmarked head-to-head against FAISS on identical data with matched
-> parameters and matched thread counts.
+> parameters and matched thread counts. Since the last gate: **persistence** (878× cheaper to
+> reopen an index than to rebuild it), incremental insert and PQ reachable from Python, and the
+> **VecCore swap landed inside EdgeRAG** with the retrieval delta measured by EdgeRAG's own harness.
 > Every number below traces to a JSON record in [`results/`](results/) carrying the git SHA, CPU,
-> compiler, flags, thread count and RNG seed that produced it — see `CONTEXT.md` D10. All 88 records
+> compiler, flags, thread count and RNG seed that produced it — see `CONTEXT.md` D10. All 89 records
 > are stamped `trusted: true` from a clean tree and a Release build. If you find a number here with
 > no record behind it, that is a bug in the README, and B-12 is the entry about the last time it
 > happened.
@@ -114,7 +116,7 @@ real regression once it reaches a plot.
 ## Continuous integration
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs four jobs on every push: the Release
-build with **80 doctest cases and 33 Python tests**, the ASan+UBSan build, the TSan build, and a
+build with **95 doctest cases and 45 Python tests**, the ASan+UBSan build, the TSan build, and a
 `pip install .` that imports the package from outside the source tree.
 
 **Two of those jobs assert that a binary fails.** `asan_probe` must abort and `tsan_probe` must
@@ -160,7 +162,7 @@ flowchart TB
     subgraph cons["consumers — each depends on the library, never the reverse"]
         direction LR
         BENCH["bench<br/>p50/p95/p99, 5+ trials"]
-        TESTS["veccore_tests<br/>80 doctest cases"]
+        TESTS["veccore_tests<br/>95 doctest cases"]
         PROBE["asan_probe, tsan_probe<br/>prove the sanitizer fires"]
         HYB["hybrid_eval<br/>BM25 vs TF-IDF"]
         PYB["_veccore<br/>pybind11, GIL released"]
@@ -168,7 +170,7 @@ flowchart TB
 
     subgraph out["evidence"]
         direction LR
-        JSONL["results/bench.jsonl<br/>88 records: git SHA, CPU, flags, seed"]
+        JSONL["results/bench.jsonl<br/>89 records: git SHA, CPU, flags, seed"]
         PLOTS["docs/plots<br/>regenerated, never hand-typed"]
     end
 
@@ -472,16 +474,116 @@ recover that ratio from a mean. FAISS's p99 at the same point is 0.567 ms — me
 interleaved session as the head-to-head table above, and 1.47× ahead, which is a slightly narrower
 gap than the 1.66× it holds on throughput.
 
-### Integrating with EdgeRAG — three claims that survive a follow-up question
+### Persistence — 878× cheaper to reopen than to rebuild
+
+An index that only exists inside the process that built it is one you pay for on every restart, and
+here that bill is large enough to be the whole argument. Measured on SIFT1M, 1,000 queries, one
+process (`bench --index persist`):
+
+| | |
+|---|---|
+| build the graph | **1,469 s** |
+| `save` | **1.24 s** |
+| `load` | **1.67 s** |
+| file on disk | **627 MiB** (488 MiB vectors + 141 MiB graph) |
+| **rebuild ÷ load** | **878×** |
+| equivalence | **10,000 results compared, 0 mismatched** |
+
+**The equivalence row is not a formality — `bench` refuses to report the timings without it.** A
+load that is fast and wrong is not a result, so the harness re-runs every query against both the
+original and the reloaded index and exits non-zero on any disagreement. 878× would be trivially
+achievable by loading nothing.
+
+*One honest wrinkle:* the build here is **1,469 s** against the **1,139 s** recorded at the Phase 2
+gate — same machine, same parameters, same seed, 29% apart. Nothing changed in the insert path; this
+is a laptop under a different thermal and background-load state, and it is exactly what `PLAN.md` §1
+warns about when it says to interleave compared configurations. The ratio above uses the build this
+run actually measured. Against the Phase 2 number it would be 682×, which is the same story told
+with a number this record cannot vouch for.
+
+**PQ is the case with the sharper argument even though the numbers are smaller.** Codebook training
+takes **86.5 s** and produces a file of codes, not vectors — 30.6 MiB at m=32 against 488 MiB of raw
+data. Reopening it is milliseconds.
+
+```python
+index.save("index.vci")
+index = veccore.HnswIndex.load("index.vci")     # vectors included, self-contained
+
+pq.save("pq.vci")
+pq = veccore.PqIndex.load("pq.vci")             # codes + codebooks; search() works immediately
+pq = veccore.PqIndex.load("pq.vci", vectors=X)  # ...and now search_rerank() does too
+```
+
+**The format is a header, not a `memcpy` to a file, and each field is there for a specific silent
+failure.** Writing `reinterpret_cast<const char*>(v.data())` to disk is three lines and works until
+it does not:
+
+| Failure | Defence | Without it |
+|---|---|---|
+| Wrong file entirely | magic bytes, checked first | a graph of garbage ids that still returns k results |
+| Format drift | version, exact match | every field after the changed one misparses; recall just gets worse |
+| Different machine | endian probe + `sizeof` fields | the same bytes mean different numbers |
+| Truncated / corrupted | FNV-1a checksum + length guards | a write interrupted at 90% whose header parses cleanly |
+
+**Only the first has an obvious symptom.** The other three produce *plausible* indexes, which on this
+project means quietly wrong recall — the same class as B-01 and B-07. Nine tests in
+`tests/test_serialize.cpp` corrupt a good file in each of those ways and assert it is **refused**.
+
+The format is **native-endian by design** and detects a mismatch rather than claiming to work across
+one. "I detect it and refuse" is a defensible position; silently producing wrong distances is not.
+
+**The RNG state travels with the file**, so an index that is saved, loaded, and then inserted into
+builds the identical graph to one that was never saved. Level assignment is a random draw, so
+dropping it would reintroduce P-03's unreproducibility one level down, in a place nobody would think
+to look. `CONTEXT.md` D15 has the full reasoning, including why HNSW files carry their vectors and PQ
+files deliberately do not.
+
+**And the bug it cost:** `PyHnsw::load` returned by value, moving the vector store out from under the
+reference the index holds into it — wrong neighbours first, then a segfault. The hazard is documented
+in `HnswIndex::load`'s own doc comment, and the binding reproduced it inside the hour, because at a
+language boundary an ownership constraint stops looking like one. `BUGS.md` B-15. A comment is not an
+invariant; deleted move constructors are.
+
+### Integrating with EdgeRAG — the swap is landed, not described
 
 ![crossover](docs/plots/crossover.png)
 
 `python/veccore/edgerag.py` implements EdgeRAG's `RetrievalIndex` protocol — the one whose docstring
 was written months before this repo existed and reads *"``VecCore`` implements this later without
-touching a caller."* It does, and no call site changes.
+touching a caller."*
 
-The pitch everyone reaches for is "VecCore made EdgeRAG's retrieval faster with HNSW." **It is
-false, and `bench/crossover.py` measures exactly how false:**
+**As of 2026-08-27 it is not a claim about a protocol, it is a second implementation living in
+EdgeRAG's own tree.** [`edgerag/retrieval/veccore_index.py`](https://github.com/Tejas544/edgerag)
+adapts EdgeRAG's `CorpusDoc` into `VecCoreIndex`, and `build_index(kind="veccore")` selects it. No
+call site changed — which is the entire argument for having built the interface first.
+
+**The numbers below come from EdgeRAG's own `recall_at_k`, not from this repo's harness.** Both
+indexes are handed the same 362 documents and the same 650 real queries and go through the same
+evaluation function with no adapter. Reproduce with `python -m scripts.measure_retrieval_swap` in
+the EdgeRAG checkout; it needs no model, no GPU and no download.
+
+| | TF-IDF (EdgeRAG's `FlatIndex`) | BM25 (VecCore) | |
+|---|---|---|---|
+| recall@1 | 0.0400 | **0.0446** | **+11.54%** relative |
+| recall@5 | 0.1846 | **0.1923** | **+4.17%** relative |
+| recall@10 | 0.2738 | **0.2862** | **+4.49%** relative |
+| index build | 46.1 ms | **9.7 ms** | 4.8× faster |
+| query p50 | 0.1153 ms | **0.0071 ms** | **16.1× faster** |
+| query p99 | 7.1990 ms | **0.0366 ms** | **197× faster** |
+
+**BM25 wins at every cutoff, and the p99 is where the algorithmic difference shows.** A 7.2 ms
+worst-case query becomes 0.037 ms because an inverted index only touches documents containing a
+query term, while the TF-IDF path builds a vocabulary-length vector and dots it against all 362.
+That is a complexity change, not a micro-optimisation, and it is the reason the tail moves ~200×
+while the median moves 16×.
+
+**Read these against the ceiling, not against 1.0.** 112 of 362 documents have no OCR text at all,
+so **no text-only retriever can exceed recall 0.3846** on this corpus. BM25 at recall@5 is 50.0% of
+what is achievable; TF-IDF is 48.0%. Quoting 0.1923 against 1.0 would make a half-of-achievable
+result look like a 19% failure.
+
+**What is deliberately *not* claimed.** The pitch everyone reaches for is "VecCore made EdgeRAG's
+retrieval faster with HNSW." **It is false, and `bench/crossover.py` measures exactly how false:**
 
 | n | brute force | HNSW | |
 |---|---|---|---|
@@ -490,18 +592,25 @@ false, and `bench/crossover.py` measures exactly how false:**
 | 10,000 | 1.0985 ms | 0.3012 ms | 3.65× |
 | 100,000 | 10.5510 ms | 0.6786 ms | 15.55× |
 
-EdgeRAG's corpus sits **3.3× below the crossover**. Graph traversal costs more than the scan it
-avoids. So the three claims actually delivered are:
+EdgeRAG's corpus sits **3.3× below the crossover**, so `use_hnsw` defaults to **False** in the
+adapter and in EdgeRAG's builder. Turning it on at 362 documents would make retrieval slower for the
+sake of a nicer architecture diagram. The win here is BM25 over TF-IDF, which does not need scale to
+be real; HNSW is the part that is *ready* for scale this corpus does not have, and the curve above
+says exactly when it would start paying.
 
-1. **No regression** — same protocol, same call sites, recall at least as good as the TF-IDF index
-   it replaces. Checked in `tests/test_edgerag_adapter.py` against the real 650-query set.
-2. **A real quality upgrade** — TF-IDF → BM25, **+4.17% relative recall@5** at **11× lower
-   latency**, measured above.
-3. **A scaling argument that is measured rather than asserted** — the curve above, with EdgeRAG's
-   position marked on it.
+**The honest boundary.** This is a **retrieval-layer** result. It is measured end-to-end through
+EdgeRAG's evaluation harness on EdgeRAG's real queries, but it is not an answer-quality number —
+nothing here claims a change in generated-answer ANLS, which would need the vision tower and the
+full generation path. `02_VECCORE.md` §5 asked for "the end-to-end delta"; what exists is the
+retrieval half of it, named as such.
 
-`use_hnsw` therefore defaults to **False** in the adapter. Turning it on at 362 documents would make
-retrieval slower for the sake of a nicer architecture diagram.
+**One thing the swap fixed in EdgeRAG on the way in.** `edgerag/retrieval/index.py` imported its
+TF-IDF vectoriser from `embed.py`, which imports `torch` at module scope — so anything touching
+retrieval pulled in a GPU stack to compute a bag of words, despite both files' docstrings saying the
+text half needs no model. The vectoriser now lives in `edgerag/retrieval/text.py` with numpy and
+nothing else, `embed.py` re-exports it, and EdgeRAG's own retrieval tests now collect and run
+without torch installed. A second implementation is a good way to find out which of your seams were
+real.
 
 ## Using it from Python
 
@@ -576,14 +685,14 @@ the end is a limitations section that flatters:
 
 - **No deletes.** Tombstones + periodic rebuild is the design; removing a node in place severs the
   links that pass *through* it and quietly damages navigability for every other query.
-- **No persistence — no `save` / `load`, in C++ or Python.** An index exists only for the lifetime
-  of the process that built it, so every restart is a full rebuild: **1,139 s for SIFT1M.** This is
-  the largest functional gap in the repo and it got sharper, not smaller, when `add` shipped — an
-  index you can grow incrementally but cannot write to disk is one you have to grow again from
-  scratch every morning. The design is not subtle (the graph is already three flat arrays plus a
-  header, so it serialises almost directly); the reason it is absent is time, and the reason it is
-  named here rather than in a roadmap is that a limitations section which omits the biggest one is
-  advertising.
+- **Persistence is single-file and single-version.** `save`/`load` exist and are measured (878×
+  cheaper than rebuilding), but the format is **native-endian, native-width, and exact-version
+  only** — it detects a mismatch and refuses rather than converting. There is no migration path
+  between format versions: bumping the version means rebuilding every index. That is the right
+  trade at this scale and it would not survive contact with a fleet that cannot afford a
+  simultaneous rebuild. There is also **no atomic replace** — `save` truncates in place, so a crash
+  mid-write destroys the previous file. Write to a temporary path and rename if that matters to
+  you; the library does not do it for you.
 - **Single node, memory resident.** 1M vectors fit in RAM. Nothing here addresses what changes at
   1B — sharding, disk-based indexes, DiskANN.
 - **No filtered search.** "Nearest neighbours, but only documents from 2024" has no clean answer in
